@@ -4,18 +4,35 @@ import json
 import subprocess
 import sys
 import queue
-
+import re
 import os
+import socket
+import mimetypes
+from urllib.parse import urlparse, parse_qs
 
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, send_file
 import pychromecast
 
 app = Flask(__name__)
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 
+
+def get_lan_ip():
+    """Get this machine's LAN IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 # Global state
 chromecasts = []
+local_file_path = None  # path to local file being served
 cast_device = None
 media_title = None
 media_thumbnail = None
@@ -23,6 +40,8 @@ media_stream_url = None
 last_url = ""
 last_device_uuid = ""
 cached_devices = []
+last_position = 0        # last known playback position
+intentional_stop = False  # True when user clicks Stop
 
 
 def save_state():
@@ -35,6 +54,8 @@ def save_state():
                 "cached_devices": cached_devices,
                 "media_title": media_title,
                 "media_thumbnail": media_thumbnail,
+                "media_stream_url": media_stream_url,
+                "last_position": last_position,
             }, f)
     except Exception:
         pass
@@ -42,7 +63,7 @@ def save_state():
 
 def load_state():
     """Restore state from disk."""
-    global last_url, last_device_uuid, cached_devices, media_title, media_thumbnail
+    global last_url, last_device_uuid, cached_devices, media_title, media_thumbnail, media_stream_url, last_position
     try:
         with open(STATE_FILE) as f:
             s = json.load(f)
@@ -51,6 +72,8 @@ def load_state():
         cached_devices = s.get("cached_devices", [])
         media_title = s.get("media_title")
         media_thumbnail = s.get("media_thumbnail")
+        media_stream_url = s.get("media_stream_url")
+        last_position = s.get("last_position", 0)
     except Exception:
         pass
 
@@ -137,6 +160,47 @@ def broadcast_status():
             sse_subscribers.remove(q)
 
 
+_resume_lock = threading.Lock()
+
+
+def auto_resume():
+    """Re-cast the last stream and seek to saved position after TV wakes."""
+    global cast_device, intentional_stop
+    if not _resume_lock.acquire(blocking=False):
+        return  # another resume already in progress
+    try:
+        # Wait a moment for the device to fully wake
+        time.sleep(5)
+        cc = cast_device
+        if not cc or not media_stream_url:
+            return
+        # Check if still idle (wasn't manually restarted)
+        try:
+            state = cc.media_controller.status.player_state
+            if state in ("PLAYING", "BUFFERING", "PAUSED"):
+                return  # already recovered on its own
+        except Exception:
+            pass
+        # Re-cast
+        mc = cc.media_controller
+        mc.play_media(
+            media_stream_url,
+            "video/mp4",
+            title=media_title or "",
+            thumb=media_thumbnail or "",
+        )
+        mc.block_until_active(timeout=30)
+        # Seek to last position
+        if last_position > 0:
+            mc.seek(last_position)
+        status_changed.set()
+        save_state()
+    except Exception:
+        pass
+    finally:
+        _resume_lock.release()
+
+
 class StatusListener:
     """Listener for pychromecast cast device status changes."""
     def new_cast_status(self, status):
@@ -146,6 +210,16 @@ class StatusListener:
 class MediaStatusListener:
     """Listener for pychromecast media status changes."""
     def new_media_status(self, status):
+        global last_position, intentional_stop
+        # Track position while playing
+        if status.player_state in ("PLAYING", "PAUSED", "BUFFERING"):
+            pos = status.adjusted_current_time or status.current_time
+            if pos:
+                last_position = pos
+                intentional_stop = False
+        # Auto-resume if cast went idle unexpectedly (TV sleep/wake)
+        elif status.player_state == "IDLE" and not intentional_stop and media_stream_url:
+            threading.Thread(target=auto_resume, daemon=True).start()
         status_changed.set()
 
 
@@ -176,6 +250,15 @@ try_reconnect()
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/media")
+def serve_media():
+    """Serve the current local file for Chromecast to stream."""
+    if not local_file_path or not os.path.isfile(local_file_path):
+        return jsonify({"error": "No file"}), 404
+    mime = mimetypes.guess_type(local_file_path)[0] or "video/mp4"
+    return send_file(local_file_path, mimetype=mime, conditional=True)
 
 
 @app.route("/api/state")
@@ -247,10 +330,31 @@ def scan():
         return jsonify({"error": str(e)}), 500
 
 
+def parse_timestamp(url):
+    """Extract start time in seconds from URL timestamp parameter."""
+    try:
+        qs = parse_qs(urlparse(url).query)
+        t = qs.get("t", qs.get("start", [None]))[0]
+        if t is None:
+            return 0
+        # Pure number = seconds
+        if t.isdigit():
+            return int(t)
+        # Format like 1h2m30s, 2m30s, 45s
+        total = 0
+        for val, unit in re.findall(r'(\d+)([hms])', t):
+            if unit == 'h': total += int(val) * 3600
+            elif unit == 'm': total += int(val) * 60
+            elif unit == 's': total += int(val)
+        return total
+    except Exception:
+        return 0
+
+
 @app.route("/api/cast", methods=["POST"])
 def cast():
     """Extract stream URL via yt-dlp and cast to selected Chromecast."""
-    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid
+    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, intentional_stop, last_position
 
     data = request.json
     url = data.get("url", "").strip()
@@ -339,6 +443,8 @@ def cast():
             cast_device.quit_app()
             time.sleep(2)
 
+        intentional_stop = False
+        last_position = 0
         media_title = video_title
         media_thumbnail = thumbnail_url
         media_stream_url = stream_url
@@ -353,6 +459,24 @@ def cast():
         )
         mc.block_until_active(timeout=30)
 
+        # Seek to timestamp if present in URL
+        start_time = parse_timestamp(url)
+
+        def seek_when_ready(controller, pos):
+            for _ in range(60):
+                try:
+                    state = controller.status.player_state
+                    if state in ("PLAYING", "BUFFERING", "PAUSED"):
+                        controller.seek(pos)
+                        status_changed.set()
+                        return
+                except Exception:
+                    pass
+                time.sleep(0.5)
+
+        if start_time > 0:
+            threading.Thread(target=seek_when_ready, args=(mc, start_time), daemon=True).start()
+
         # Trigger an immediate SSE push
         status_changed.set()
         save_state()
@@ -361,6 +485,99 @@ def cast():
             "status": "casting",
             "title": video_title,
             "thumbnail": thumbnail_url,
+            "stream_url": stream_url,
+            "start_time": start_time,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+@app.route("/api/cast_file", methods=["POST"])
+def cast_file():
+    """Upload a local file and cast it to Chromecast."""
+    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, local_file_path, intentional_stop, last_position
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded"}), 400
+
+    file = request.files["file"]
+    device_uuid = request.form.get("device_uuid", "").strip()
+
+    if not file.filename:
+        return jsonify({"error": "No file selected"}), 400
+    if not device_uuid:
+        return jsonify({"error": "No device selected"}), 400
+
+    # Save uploaded file
+    filepath = os.path.join(UPLOAD_DIR, file.filename)
+    file.save(filepath)
+    local_file_path = filepath
+
+    video_title = file.filename
+    thumbnail_url = ""
+    lan_ip = get_lan_ip()
+    stream_url = f"http://{lan_ip}:5000/api/media"
+    mime = mimetypes.guess_type(filepath)[0] or "video/mp4"
+
+    last_url = file.filename
+    last_device_uuid = device_uuid
+
+    # Find the selected device
+    target_service = None
+    for service in chromecasts:
+        if str(service.uuid) == device_uuid:
+            target_service = service
+            break
+
+    if not target_service:
+        return jsonify({"error": "Device not found. Try scanning again."}), 404
+
+    # Connect to Chromecast
+    try:
+        if cast_device:
+            try:
+                cast_device.disconnect(timeout=5)
+            except Exception:
+                pass
+            cast_device = None
+
+        casts, browser = pychromecast.get_listed_chromecasts(
+            friendly_names=[target_service.friendly_name]
+        )
+        if not casts:
+            pychromecast.discovery.stop_discovery(browser)
+            return jsonify({"error": "Could not connect to Chromecast"}), 500
+
+        cast_device = casts[0]
+        cast_device.wait(timeout=30)
+        pychromecast.discovery.stop_discovery(browser)
+
+        register_listeners(cast_device)
+
+        if cast_device.app_id:
+            cast_device.quit_app()
+            time.sleep(2)
+
+        intentional_stop = False
+        last_position = 0
+        media_title = video_title
+        media_thumbnail = thumbnail_url
+        media_stream_url = stream_url
+
+        mc = cast_device.media_controller
+        mc.play_media(stream_url, mime, title=video_title)
+        mc.block_until_active(timeout=30)
+
+        status_changed.set()
+        save_state()
+
+        return jsonify({
+            "status": "casting",
+            "title": video_title,
             "stream_url": stream_url,
         })
     except Exception as e:
@@ -389,10 +606,12 @@ def pause():
 
 @app.route("/api/stop", methods=["POST"])
 def stop():
-    global cast_device, media_title, media_thumbnail, media_stream_url
+    global cast_device, media_title, media_thumbnail, media_stream_url, intentional_stop, last_position
     cc = cast_device
     if not cc:
         return jsonify({"error": "No active cast"}), 400
+    intentional_stop = True
+    last_position = 0
     cc.media_controller.stop()
     media_title = None
     media_thumbnail = None
