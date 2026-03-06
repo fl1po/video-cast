@@ -1,0 +1,864 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>YT Chromecast Controller</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #121212;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .app {
+    width: 100%;
+    max-width: 520px;
+  }
+
+  h1 {
+    text-align: center;
+    font-size: 1.4rem;
+    font-weight: 600;
+    margin-bottom: 28px;
+    color: #fff;
+    letter-spacing: -0.02em;
+  }
+
+  .section {
+    background: #1e1e1e;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  label {
+    display: block;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #888;
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+
+  .row {
+    display: flex;
+    gap: 8px;
+  }
+
+  input[type="text"] {
+    flex: 1;
+    background: #2a2a2a;
+    border: 1px solid #383838;
+    border-radius: 8px;
+    color: #fff;
+    padding: 10px 14px;
+    font-size: 0.95rem;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  input[type="text"]:focus { border-color: #e53935; }
+
+  select {
+    flex: 1;
+    background: #2a2a2a;
+    border: 1px solid #383838;
+    border-radius: 8px;
+    color: #fff;
+    padding: 10px 14px;
+    font-size: 0.95rem;
+    outline: none;
+    appearance: none;
+    cursor: pointer;
+  }
+
+  button {
+    background: #e53935;
+    color: #fff;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.15s;
+    white-space: nowrap;
+  }
+  button:hover { background: #f44336; }
+  button:active { background: #c62828; }
+  button:disabled { background: #444; cursor: not-allowed; }
+
+  .btn-icon {
+    padding: 10px 12px;
+    font-size: 1.1rem;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 42px;
+  }
+
+  .btn-secondary {
+    background: #333;
+  }
+  .btn-secondary:hover { background: #444; }
+
+  /* Video Player */
+  .video-wrap {
+    border-radius: 8px;
+    overflow: hidden;
+    background: #000;
+    position: relative;
+  }
+
+  .video-wrap video {
+    width: 100%;
+    display: block;
+    cursor: pointer;
+  }
+
+  /* Loading overlay (center) */
+  .video-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.5);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+    z-index: 3;
+  }
+  .video-overlay.visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .overlay-text {
+    color: #fff;
+    font-size: 0.9rem;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .spinner {
+    width: 20px;
+    height: 20px;
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  /* Controls overlay — full video, visible on hover / tap */
+  .video-controls {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    transition: opacity 0.25s;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+  }
+  .video-wrap:hover .video-controls,
+  .video-controls.touch-visible { opacity: 1; }
+
+  /* Top: gradient + status */
+  .ctrl-top {
+    background: linear-gradient(rgba(0,0,0,0.6), transparent);
+    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .status-text {
+    font-size: 0.7rem;
+    color: rgba(255,255,255,0.7);
+  }
+
+  .stop-btn {
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+    border-radius: 4px;
+    padding: 0;
+    width: 28px;
+    height: 28px;
+    font-size: 0.8rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .stop-btn:hover { background: rgba(255,255,255,0.3); }
+
+  /* Middle: three tap zones — rewind, play/pause, forward */
+  .ctrl-mid {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .tap-zone {
+    flex: 1;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border: none;
+    background: none;
+    color: #fff;
+  }
+  .tap-zone:hover { background: none; }
+  .tap-zone:active .tap-icon { transform: scale(0.85); }
+
+  .tap-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 50%;
+    background: rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    transition: transform 0.1s;
+    flex-direction: column;
+    gap: 1px;
+    line-height: 1;
+  }
+  .tap-icon.play-icon {
+    width: 60px;
+    height: 60px;
+    background: rgba(0,0,0,0.5);
+    font-size: 1.6rem;
+    font-weight: 400;
+  }
+  .tap-icon .skip-arrow { font-size: 1rem; }
+  .tap-icon .skip-label { font-size: 0.55rem; }
+
+  /* Bottom: progress + volume */
+  .ctrl-bottom {
+    background: linear-gradient(transparent, rgba(0,0,0,0.7));
+    padding: 10px 12px 8px;
+  }
+
+  .progress-bar {
+    width: 100%;
+    height: 4px;
+    background: rgba(255,255,255,0.2);
+    border-radius: 2px;
+    cursor: pointer;
+    position: relative;
+    overflow: visible;
+    transition: height 0.15s;
+  }
+  .video-wrap:hover .progress-bar { height: 6px; }
+
+  .seek-tooltip {
+    position: absolute;
+    bottom: 14px;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.85);
+    color: #fff;
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 3px 7px;
+    border-radius: 3px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .seek-tooltip.visible { opacity: 1; }
+
+  .progress-fill {
+    height: 100%;
+    background: #e53935;
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.3s linear;
+  }
+
+  .bottom-row {
+    display: flex;
+    align-items: center;
+    margin-top: 4px;
+  }
+
+  .progress-times {
+    font-size: 0.7rem;
+    color: rgba(255,255,255,0.6);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .vol-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .vol-group .vol-icon {
+    font-size: 0.85rem;
+    cursor: pointer;
+    width: auto;
+    background: none;
+    color: #fff;
+    padding: 4px;
+  }
+  .vol-group .vol-icon:hover { background: none; }
+
+  .vol-group input[type="range"] {
+    width: 60px;
+    -webkit-appearance: none;
+    appearance: none;
+    height: 3px;
+    background: rgba(255,255,255,0.2);
+    border-radius: 2px;
+    outline: none;
+  }
+  .vol-group input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px;
+    height: 10px;
+    background: #fff;
+    border-radius: 50%;
+    cursor: pointer;
+  }
+  .vol-group input[type="range"]::-moz-range-thumb {
+    width: 10px;
+    height: 10px;
+    background: #fff;
+    border-radius: 50%;
+    border: none;
+    cursor: pointer;
+  }
+
+  .vol-pct {
+    font-size: 0.65rem;
+    color: rgba(255,255,255,0.5);
+    width: 26px;
+    text-align: right;
+  }
+
+  .fs-btn {
+    background: none;
+    color: rgba(255,255,255,0.7);
+    border: none;
+    font-size: 1.1rem;
+    padding: 4px;
+    margin-left: 4px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .fs-btn:hover { color: #fff; background: none; }
+
+  /* Mobile */
+  @media (max-width: 520px) {
+    body { padding: 16px 8px; }
+    h1 { font-size: 1.2rem; margin-bottom: 16px; }
+    .section { padding: 14px; margin-bottom: 10px; border-radius: 10px; }
+    input[type="text"], select { font-size: 16px; padding: 12px; }
+    button { padding: 12px 16px; }
+
+    .tap-icon { width: 42px; height: 42px; }
+    .tap-icon.play-icon { width: 52px; height: 52px; font-size: 1.4rem; }
+
+    .progress-bar { height: 6px; }
+    .vol-group input[type="range"] { width: 50px; }
+  }
+
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(80px);
+    background: #333;
+    color: #fff;
+    padding: 10px 20px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    opacity: 0;
+    transition: all 0.3s;
+    pointer-events: none;
+    z-index: 100;
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+  .toast.error { background: #b71c1c; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>YT Chromecast Controller</h1>
+
+  <!-- Device Selection -->
+  <div class="section">
+    <label>Chromecast Device</label>
+    <div class="row">
+      <select id="deviceSelect">
+        <option value="">-- Click Scan to find devices --</option>
+      </select>
+      <button class="btn-icon btn-secondary" id="scanBtn" title="Scan for devices">&#x1F50D;</button>
+    </div>
+  </div>
+
+  <!-- URL Input -->
+  <div class="section">
+    <label>Video URL</label>
+    <div class="row">
+      <input type="text" id="urlInput" placeholder="Paste any video URL (YouTube, Twitch, Twitter, etc.)" />
+      <button id="castBtn">Cast</button>
+    </div>
+  </div>
+
+  <!-- Video Player + Controls Overlay -->
+  <div class="section" id="videoSection" style="display:none;">
+    <label id="videoTitle">Now Playing</label>
+    <div class="video-wrap" id="videoWrap">
+      <video id="videoPlayer" muted playsinline webkit-playsinline></video>
+      <div class="video-overlay" id="videoOverlay">
+        <div class="overlay-text"><div class="spinner"></div> <span id="overlayMsg">Loading...</span></div>
+      </div>
+      <div class="video-controls" id="videoControls">
+        <div class="ctrl-top">
+          <span class="status-text" id="statusBar">Not connected</span>
+          <button class="stop-btn" id="stopBtn" title="Stop">&#x23F9;</button>
+        </div>
+        <div class="ctrl-mid">
+          <button class="tap-zone" data-skip="-10" title="Rewind 10s">
+            <div class="tap-icon"><span class="skip-arrow">&#x21BA;</span><span class="skip-label">10</span></div>
+          </button>
+          <button class="tap-zone" id="playPauseZone" title="Play / Pause">
+            <div class="tap-icon play-icon" id="playPauseIcon">&#x25B6;</div>
+          </button>
+          <button class="tap-zone" data-skip="10" title="Forward 10s">
+            <div class="tap-icon"><span class="skip-arrow">&#x21BB;</span><span class="skip-label">10</span></div>
+          </button>
+        </div>
+        <div class="ctrl-bottom">
+          <div class="progress-bar" id="progressBar">
+            <div class="progress-fill" id="progressFill"></div>
+            <span class="seek-tooltip" id="seekTooltip">0:00</span>
+          </div>
+          <div class="bottom-row">
+            <span class="progress-times"><span id="timeElapsed">0:00</span> / <span id="timeDuration">0:00</span></span>
+            <div class="vol-group">
+              <button class="vol-icon" id="muteBtn" title="Mute">&#x1F509;</button>
+              <input type="range" id="volumeSlider" min="0" max="100" value="50" />
+              <span class="vol-pct" id="volumePct">50%</span>
+            </div>
+            <button class="fs-btn" id="fsBtn" title="Fullscreen">&#x26F6;</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+const deviceSelect = $("deviceSelect");
+const scanBtn = $("scanBtn");
+const urlInput = $("urlInput");
+const castBtn = $("castBtn");
+const videoSection = $("videoSection");
+const videoTitle = $("videoTitle");
+const progressBar = $("progressBar");
+const progressFill = $("progressFill");
+const timeElapsed = $("timeElapsed");
+const timeDuration = $("timeDuration");
+const playPauseZone = $("playPauseZone");
+const playPauseIcon = $("playPauseIcon");
+const stopBtn = $("stopBtn");
+const videoWrap = $("videoWrap");
+const videoPlayer = $("videoPlayer");
+const videoOverlay = $("videoOverlay");
+const overlayMsg = $("overlayMsg");
+const videoControlsEl = $("videoControls");
+const volumeSlider = $("volumeSlider");
+const volumePct = $("volumePct");
+const statusBar = $("statusBar");
+const toast = $("toast");
+
+let currentState = "IDLE";
+let isSeeking = false;
+let volumeChanging = false;
+let currentStreamUrl = "";
+let lastCastTime = 0;     // latest current_time from Chromecast
+
+function showToast(msg, isError) {
+  toast.textContent = msg;
+  toast.className = "toast show" + (isError ? " error" : "");
+  setTimeout(() => toast.className = "toast", 3000);
+}
+
+function formatTime(sec) {
+  if (!sec || sec < 0) return "0:00";
+  sec = Math.floor(sec);
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return m + ":" + (s < 10 ? "0" : "") + s;
+}
+
+async function api(path, method, body) {
+  const opts = { method };
+  if (body) {
+    opts.headers = { "Content-Type": "application/json" };
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Request failed");
+  return data;
+}
+
+// Scan
+scanBtn.addEventListener("click", async () => {
+  scanBtn.disabled = true;
+  scanBtn.textContent = "...";
+  try {
+    const data = await api("/api/scan", "GET");
+    deviceSelect.innerHTML = "";
+    if (data.devices.length === 0) {
+      deviceSelect.innerHTML = '<option value="">No devices found</option>';
+      showToast("No Chromecast devices found", true);
+    } else {
+      data.devices.forEach(d => {
+        const opt = document.createElement("option");
+        opt.value = d.uuid;
+        opt.textContent = d.friendly_name + (d.model_name ? " (" + d.model_name + ")" : "");
+        deviceSelect.appendChild(opt);
+      });
+      showToast("Found " + data.devices.length + " device(s)");
+    }
+  } catch (e) {
+    showToast("Scan failed: " + e.message, true);
+  } finally {
+    scanBtn.disabled = false;
+    scanBtn.innerHTML = "&#x1F50D;";
+  }
+});
+
+// Cast
+castBtn.addEventListener("click", async () => {
+  const url = urlInput.value.trim();
+  const device_uuid = deviceSelect.value;
+  if (!url) return showToast("Enter a YouTube URL", true);
+  if (!device_uuid) return showToast("Select a device first", true);
+
+  castBtn.disabled = true;
+  castBtn.textContent = "Casting...";
+  videoSection.style.display = "block";
+  showOverlay("Loading...");
+  try {
+    const data = await api("/api/cast", "POST", { url, device_uuid });
+    showToast("Casting: " + data.title);
+    if (data.stream_url) {
+      currentStreamUrl = data.stream_url;
+      videoPlayer.src = data.stream_url;
+      videoTitle.textContent = data.title || "Now Playing";
+      videoSection.style.display = "block";
+    }
+  } catch (e) {
+    showToast("Cast failed: " + e.message, true);
+    hideOverlay();
+    if (!currentStreamUrl) videoSection.style.display = "none";
+  } finally {
+    castBtn.disabled = false;
+    castBtn.textContent = "Cast";
+  }
+});
+
+// Overlay
+function showOverlay(msg) {
+  overlayMsg.textContent = msg;
+  videoOverlay.classList.add("visible");
+}
+function hideOverlay() {
+  videoOverlay.classList.remove("visible");
+}
+
+// Optimistic UI update
+function optimisticState(state) {
+  currentState = state;
+  statusBar.textContent = state;
+  if (state === "BUFFERING") showOverlay("Buffering...");
+  else if (state === "PLAYING" || state === "PAUSED") hideOverlay();
+}
+
+// Touch: tap video to show/hide controls overlay
+const isTouch = matchMedia("(hover: none)").matches;
+let touchTimer = null;
+
+function resetTouchTimer() {
+  clearTimeout(touchTimer);
+  touchTimer = setTimeout(() => videoControlsEl.classList.remove("touch-visible"), 4000);
+}
+
+videoPlayer.addEventListener("click", () => {
+  if (isTouch) {
+    videoControlsEl.classList.toggle("touch-visible");
+    if (videoControlsEl.classList.contains("touch-visible")) resetTouchTimer();
+  }
+});
+
+// Keep controls visible while interacting on touch
+videoControlsEl.addEventListener("click", (e) => {
+  if (isTouch && e.target !== videoPlayer) resetTouchTimer();
+});
+
+// Center zone: play/pause toggle
+function updatePlayPauseIcon() {
+  playPauseIcon.innerHTML = currentState === "PLAYING" ? "&#x23F8;" : "&#x25B6;";
+}
+
+playPauseZone.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (currentState === "PLAYING") {
+    optimisticState("PAUSED");
+    videoPlayer.pause();
+    api("/api/pause", "POST").catch(e => showToast(e.message, true));
+  } else {
+    optimisticState("PLAYING");
+    videoPlayer.play().catch(() => {});
+    api("/api/play", "POST").catch(e => showToast(e.message, true));
+  }
+  updatePlayPauseIcon();
+});
+
+// Skip zones (rewind / forward)
+document.querySelectorAll(".tap-zone[data-skip]").forEach(zone => {
+  zone.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const delta = parseInt(zone.dataset.skip);
+    const dur = parseFloat(timeDuration.dataset.raw || 0);
+    const cur = videoPlayer.currentTime || 0;
+    const pos = Math.max(0, Math.min(dur, cur + delta));
+    isSeeking = true;
+    const pct = dur > 0 ? (pos / dur * 100) : 0;
+    progressFill.style.width = pct + "%";
+    timeElapsed.textContent = formatTime(pos);
+    videoPlayer.currentTime = pos;
+    api("/api/seek", "POST", { position: pos })
+      .catch(e2 => showToast(e2.message, true));
+    setTimeout(() => isSeeking = false, 1500);
+  });
+});
+
+// Stop
+stopBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  optimisticState("IDLE");
+  videoPlayer.pause();
+  videoPlayer.removeAttribute("src");
+  videoSection.style.display = "none";
+  currentStreamUrl = "";
+  updatePlayPauseIcon();
+  api("/api/stop", "POST").catch(e => showToast(e.message, true));
+});
+
+// Volume
+let volumeTimeout;
+let prevVolume = 50;
+const muteBtn = $("muteBtn");
+
+volumeSlider.addEventListener("input", (e) => {
+  e.stopPropagation();
+  volumePct.textContent = volumeSlider.value + "%";
+  volumeChanging = true;
+  clearTimeout(volumeTimeout);
+  volumeTimeout = setTimeout(() => {
+    api("/api/volume", "POST", { level: volumeSlider.value / 100 })
+      .catch(e => showToast(e.message, true));
+    volumeChanging = false;
+  }, 200);
+});
+
+muteBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (parseInt(volumeSlider.value) > 0) {
+    prevVolume = volumeSlider.value;
+    volumeSlider.value = 0;
+  } else {
+    volumeSlider.value = prevVolume || 50;
+  }
+  volumePct.textContent = volumeSlider.value + "%";
+  api("/api/volume", "POST", { level: volumeSlider.value / 100 })
+    .catch(e => showToast(e.message, true));
+});
+
+// Fullscreen
+const fsBtn = $("fsBtn");
+fsBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (document.fullscreenElement) {
+    document.exitFullscreen();
+  } else {
+    videoWrap.requestFullscreen().catch(() => {});
+  }
+});
+
+// Seek tooltip on progress bar hover
+const seekTooltip = $("seekTooltip");
+
+progressBar.addEventListener("mousemove", (e) => {
+  const rect = progressBar.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  if (dur > 0) {
+    seekTooltip.textContent = formatTime(pct * dur);
+    seekTooltip.style.left = (pct * 100) + "%";
+    seekTooltip.classList.add("visible");
+  }
+});
+
+progressBar.addEventListener("mouseleave", () => {
+  seekTooltip.classList.remove("visible");
+});
+
+// Seek on progress bar click
+progressBar.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const rect = progressBar.getBoundingClientRect();
+  const pct = (e.clientX - rect.left) / rect.width;
+  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  if (dur > 0) {
+    const pos = pct * dur;
+    isSeeking = true;
+    progressFill.style.width = (pct * 100) + "%";
+    timeElapsed.textContent = formatTime(pos);
+    videoPlayer.currentTime = pos;
+    api("/api/seek", "POST", { position: pos })
+      .catch(e2 => showToast(e2.message, true));
+    setTimeout(() => isSeeking = false, 1500);
+  }
+});
+
+// SSE status stream
+function handleStatus(s) {
+  currentState = s.state;
+
+  if (s.connected && s.state !== "IDLE" && s.state !== "UNKNOWN") {
+    statusBar.textContent = s.state;
+    updatePlayPauseIcon();
+
+    // Overlay for loading/buffering states
+    if (s.state === "BUFFERING") showOverlay("Buffering...");
+    else if (s.state === "PLAYING" || s.state === "PAUSED") hideOverlay();
+
+    // Progress
+    if (!isSeeking) {
+      const pct = s.duration > 0 ? (s.current_time / s.duration * 100) : 0;
+      progressFill.style.width = pct + "%";
+      timeElapsed.textContent = formatTime(s.current_time);
+      timeDuration.textContent = formatTime(s.duration);
+      timeDuration.dataset.raw = s.duration;
+    }
+
+    // Volume
+    if (!volumeChanging) {
+      const vol = Math.round(s.volume * 100);
+      volumeSlider.value = vol;
+      volumePct.textContent = vol + "%";
+    }
+
+    // Video player — load if new stream
+    if (s.stream_url && s.stream_url !== currentStreamUrl) {
+      currentStreamUrl = s.stream_url;
+      videoPlayer.src = s.stream_url;
+      videoTitle.textContent = s.title || "Now Playing";
+      videoSection.style.display = "block";
+      videoPlayer.currentTime = s.current_time || 0;
+      if (s.state === "PLAYING") videoPlayer.play().catch(() => {});
+    }
+
+    // Track Chromecast position for resync
+    lastCastTime = s.current_time || 0;
+
+    // Sync local video with Chromecast state
+    if (currentStreamUrl && !isSeeking) {
+      // Only correct if local video is behind the Chromecast by >2s
+      const drift = s.current_time - videoPlayer.currentTime;
+      if (drift > 2) {
+        videoPlayer.currentTime = s.current_time;
+      }
+      if (s.state === "PLAYING" && videoPlayer.paused) {
+        videoPlayer.play().catch(() => {});
+      } else if (s.state === "PAUSED" && !videoPlayer.paused) {
+        videoPlayer.pause();
+      }
+    }
+  } else {
+    statusBar.textContent = s.connected ? "Idle" : "Not connected";
+    if (s.state === "IDLE" || !s.connected) {
+    
+      if (currentStreamUrl) {
+        videoPlayer.pause();
+        videoPlayer.removeAttribute("src");
+        videoSection.style.display = "none";
+        currentStreamUrl = "";
+      }
+    }
+  }
+}
+
+const evtSource = new EventSource("/api/events");
+evtSource.onmessage = (e) => {
+  try { handleStatus(JSON.parse(e.data)); } catch {}
+};
+evtSource.onerror = () => { statusBar.textContent = "Connection lost — reconnecting..."; };
+
+// Allow casting with Enter key
+urlInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") castBtn.click();
+});
+
+// Load saved state (URL + devices + playback) on startup
+(async () => {
+  try {
+    const s = await api("/api/state", "GET");
+    if (s.url) urlInput.value = s.url;
+    if (s.devices && s.devices.length > 0) {
+      deviceSelect.innerHTML = "";
+      s.devices.forEach(d => {
+        const opt = document.createElement("option");
+        opt.value = d.uuid;
+        opt.textContent = d.friendly_name + (d.model_name ? " (" + d.model_name + ")" : "");
+        if (d.uuid === s.device_uuid) opt.selected = true;
+        deviceSelect.appendChild(opt);
+      });
+    }
+    // Restore active playback
+    if (s.playback && s.playback.connected && s.playback.state !== "IDLE" && s.playback.state !== "UNKNOWN") {
+      handleStatus(s.playback);
+    }
+  } catch {}
+})();
+</script>
+</body>
+</html>
