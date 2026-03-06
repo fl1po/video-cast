@@ -373,6 +373,7 @@ def play():
     if not cc:
         return jsonify({"error": "No active cast"}), 400
     cc.media_controller.play()
+    status_changed.set()
     return jsonify({"status": "playing"})
 
 
@@ -382,6 +383,7 @@ def pause():
     if not cc:
         return jsonify({"error": "No active cast"}), 400
     cc.media_controller.pause()
+    status_changed.set()
     return jsonify({"status": "paused"})
 
 
@@ -411,6 +413,7 @@ def volume():
         return jsonify({"error": "No volume level provided"}), 400
     level = max(0.0, min(1.0, float(level)))
     cc.set_volume(level)
+    status_changed.set()
     return jsonify({"volume": level})
 
 
@@ -424,6 +427,7 @@ def seek():
     if position is None:
         return jsonify({"error": "No position provided"}), 400
     cc.media_controller.seek(float(position))
+    status_changed.set()
     return jsonify({"position": position})
 
 

@@ -741,14 +741,16 @@ videoPlayer.addEventListener("seeked", () => {
 });
 
 videoPlayer.addEventListener("pause", () => {
-  if (!currentStreamUrl || currentState === "PAUSED" || currentState === "IDLE") return;
+  if (!currentStreamUrl || isSeeking || programmaticSeek) return;
+  if (currentState === "PAUSED" || currentState === "IDLE") return;
   optimisticState("PAUSED");
   updatePlayPauseIcon();
   api("/api/pause", "POST").catch(e => showToast(e.message, true));
 });
 
 videoPlayer.addEventListener("play", () => {
-  if (!currentStreamUrl || currentState === "PLAYING") return;
+  if (!currentStreamUrl || isSeeking || programmaticSeek) return;
+  if (currentState === "PLAYING") return;
   optimisticState("PLAYING");
   updatePlayPauseIcon();
   api("/api/play", "POST").catch(e => showToast(e.message, true));
@@ -884,17 +886,13 @@ function handleStatus(s) {
     // Track Chromecast position for resync
     lastCastTime = s.current_time || 0;
 
-    // Sync local video with Chromecast state
+    // Mirror Chromecast: just copy its position and state
     if (currentStreamUrl && !isSeeking) {
-      // Only correct if local video is behind the Chromecast by >2s
-      const drift = s.current_time - videoPlayer.currentTime;
-      if (drift > 2) {
-        programmaticSeek = true;
-        videoPlayer.currentTime = s.current_time;
-      }
+      programmaticSeek = true;
+      videoPlayer.currentTime = s.current_time;
       if (s.state === "PLAYING" && videoPlayer.paused) {
         videoPlayer.play().catch(() => {});
-      } else if (s.state === "PAUSED" && !videoPlayer.paused) {
+      } else if (s.state !== "PLAYING" && !videoPlayer.paused) {
         videoPlayer.pause();
       }
     }
