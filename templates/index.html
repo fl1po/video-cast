@@ -175,8 +175,9 @@
     display: flex;
     flex-direction: column;
   }
-  .video-wrap:hover .video-controls,
-  .video-controls.touch-visible { opacity: 1; }
+  .video-controls.active { opacity: 1; }
+  .video-wrap.hide-cursor,
+  .video-wrap.hide-cursor * { cursor: none !important; }
 
   /* Top: gradient + status */
   .ctrl-top {
@@ -206,52 +207,46 @@
   }
   .stop-btn:hover { background: rgba(255,255,255,0.3); }
 
-  /* Middle: three tap zones — rewind, play/pause, forward */
+  /* Middle: centered control buttons */
   .ctrl-mid {
     flex: 1;
     display: flex;
     align-items: center;
     justify-content: center;
+    gap: 20px;
   }
 
-  .tap-zone {
-    flex: 1;
-    height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: pointer;
-    border: none;
-    background: none;
-    color: #fff;
-  }
-  .tap-zone:hover { background: none; }
-  .tap-zone:active .tap-icon { transform: scale(0.85); }
-
-  .tap-icon {
-    width: 48px;
-    height: 48px;
+  .ctrl-btn {
+    width: 42px;
+    height: 42px;
     border-radius: 50%;
     background: rgba(0,0,0,0.4);
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 0.75rem;
-    font-weight: 700;
-    transition: transform 0.1s;
+    cursor: pointer;
+    border: none;
+    color: #fff;
+    transition: transform 0.1s, background 0.15s;
     flex-direction: column;
     gap: 1px;
     line-height: 1;
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0;
   }
-  .tap-icon.play-icon {
-    width: 60px;
-    height: 60px;
+  .ctrl-btn:hover { background: rgba(255,255,255,0.2); }
+  .ctrl-btn:active { transform: scale(0.85); }
+
+  .ctrl-btn.play-btn {
+    width: 56px;
+    height: 56px;
     background: rgba(0,0,0,0.5);
-    font-size: 1.6rem;
+    font-size: 1.5rem;
     font-weight: 400;
   }
-  .tap-icon .skip-arrow { font-size: 1rem; }
-  .tap-icon .skip-label { font-size: 0.55rem; }
+  .ctrl-btn .skip-arrow { font-size: 1rem; }
+  .ctrl-btn .skip-label { font-size: 0.55rem; }
 
   /* Bottom: progress + volume */
   .ctrl-bottom {
@@ -269,7 +264,7 @@
     overflow: visible;
     transition: height 0.15s;
   }
-  .video-wrap:hover .progress-bar { height: 6px; }
+  .video-controls.active .progress-bar { height: 6px; }
 
   .seek-tooltip {
     position: absolute;
@@ -379,8 +374,9 @@
     input[type="text"], select { font-size: 16px; padding: 12px; }
     button { padding: 12px 16px; }
 
-    .tap-icon { width: 42px; height: 42px; }
-    .tap-icon.play-icon { width: 52px; height: 52px; font-size: 1.4rem; }
+    .ctrl-btn { width: 38px; height: 38px; }
+    .ctrl-btn.play-btn { width: 48px; height: 48px; font-size: 1.3rem; }
+    .ctrl-mid { gap: 16px; }
 
     .progress-bar { height: 6px; }
     .vol-group input[type="range"] { width: 50px; }
@@ -446,14 +442,14 @@
           <button class="stop-btn" id="stopBtn" title="Stop">&#x23F9;</button>
         </div>
         <div class="ctrl-mid">
-          <button class="tap-zone" data-skip="-10" title="Rewind 10s">
-            <div class="tap-icon"><span class="skip-arrow">&#x21BA;</span><span class="skip-label">10</span></div>
+          <button class="ctrl-btn" data-skip="-10" title="Rewind 10s">
+            <span class="skip-arrow">&#x21BA;</span><span class="skip-label">10</span>
           </button>
-          <button class="tap-zone" id="playPauseZone" title="Play / Pause">
-            <div class="tap-icon play-icon" id="playPauseIcon">&#x25B6;</div>
+          <button class="ctrl-btn play-btn" id="playPauseZone" title="Play / Pause">
+            <span id="playPauseIcon">&#x25B6;</span>
           </button>
-          <button class="tap-zone" data-skip="10" title="Forward 10s">
-            <div class="tap-icon"><span class="skip-arrow">&#x21BB;</span><span class="skip-label">10</span></div>
+          <button class="ctrl-btn" data-skip="10" title="Forward 10s">
+            <span class="skip-arrow">&#x21BB;</span><span class="skip-label">10</span>
           </button>
         </div>
         <div class="ctrl-bottom">
@@ -507,6 +503,7 @@ const toast = $("toast");
 
 let currentState = "IDLE";
 let isSeeking = false;
+let programmaticSeek = false;  // true when we set currentTime from code
 let volumeChanging = false;
 let currentStreamUrl = "";
 let lastCastTime = 0;     // latest current_time from Chromecast
@@ -609,27 +606,72 @@ function optimisticState(state) {
   statusBar.textContent = state;
   if (state === "BUFFERING") showOverlay("Buffering...");
   else if (state === "PLAYING" || state === "PAUSED") hideOverlay();
+  // Show controls when paused, start idle timer when playing
+  if (state === "PAUSED") {
+    videoControlsEl.classList.add("active");
+    videoWrap.classList.remove("hide-cursor");
+    clearTimeout(idleTimer);
+  } else if (state === "PLAYING") {
+    showControls();
+  }
 }
 
-// Touch: tap video to show/hide controls overlay
+// Idle-hide controls (like YouTube)
+let idleTimer = null;
+
+function showControls() {
+  videoControlsEl.classList.add("active");
+  videoWrap.classList.remove("hide-cursor");
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(hideControls, 3000);
+}
+
+function hideControls() {
+  // Don't hide while paused — user likely wants to see controls
+  if (currentState !== "PLAYING") return;
+  videoControlsEl.classList.remove("active");
+  videoWrap.classList.add("hide-cursor");
+}
+
+// Mouse: show on move, hide after 3s idle
+videoWrap.addEventListener("mousemove", showControls);
+videoWrap.addEventListener("mouseleave", () => {
+  clearTimeout(idleTimer);
+  videoControlsEl.classList.remove("active");
+});
+
+// Touch: tap to toggle
 const isTouch = matchMedia("(hover: none)").matches;
-let touchTimer = null;
-
-function resetTouchTimer() {
-  clearTimeout(touchTimer);
-  touchTimer = setTimeout(() => videoControlsEl.classList.remove("touch-visible"), 4000);
-}
 
 videoPlayer.addEventListener("click", () => {
   if (isTouch) {
-    videoControlsEl.classList.toggle("touch-visible");
-    if (videoControlsEl.classList.contains("touch-visible")) resetTouchTimer();
+    if (videoControlsEl.classList.contains("active")) {
+      clearTimeout(idleTimer);
+      videoControlsEl.classList.remove("active");
+    } else {
+      showControls();
+    }
   }
 });
 
-// Keep controls visible while interacting on touch
+// Double-tap / double-click to toggle fullscreen
+let lastTapTime = 0;
+videoWrap.addEventListener("click", (e) => {
+  // Ignore if clicking on control buttons
+  if (e.target.closest(".ctrl-btn, .stop-btn, .progress-bar, .vol-group, .fs-btn")) return;
+  const now = Date.now();
+  if (now - lastTapTime < 400) {
+    // Double tap detected
+    lastTapTime = 0;
+    toggleFullscreen();
+  } else {
+    lastTapTime = now;
+  }
+});
+
+// Keep controls visible while interacting
 videoControlsEl.addEventListener("click", (e) => {
-  if (isTouch && e.target !== videoPlayer) resetTouchTimer();
+  if (e.target !== videoPlayer) showControls();
 });
 
 // Center zone: play/pause toggle
@@ -651,8 +693,8 @@ playPauseZone.addEventListener("click", (e) => {
   updatePlayPauseIcon();
 });
 
-// Skip zones (rewind / forward)
-document.querySelectorAll(".tap-zone[data-skip]").forEach(zone => {
+// Skip buttons (rewind / forward)
+document.querySelectorAll(".ctrl-btn[data-skip]").forEach(zone => {
   zone.addEventListener("click", (e) => {
     e.stopPropagation();
     const delta = parseInt(zone.dataset.skip);
@@ -663,6 +705,7 @@ document.querySelectorAll(".tap-zone[data-skip]").forEach(zone => {
     const pct = dur > 0 ? (pos / dur * 100) : 0;
     progressFill.style.width = pct + "%";
     timeElapsed.textContent = formatTime(pos);
+    programmaticSeek = true;
     videoPlayer.currentTime = pos;
     api("/api/seek", "POST", { position: pos })
       .catch(e2 => showToast(e2.message, true));
@@ -680,6 +723,35 @@ stopBtn.addEventListener("click", (e) => {
   currentStreamUrl = "";
   updatePlayPauseIcon();
   api("/api/stop", "POST").catch(e => showToast(e.message, true));
+});
+
+// Sync native video controls (iOS fullscreen) back to Chromecast
+videoPlayer.addEventListener("seeked", () => {
+  if (programmaticSeek) { programmaticSeek = false; return; }
+  if (!currentStreamUrl) return;
+  const pos = videoPlayer.currentTime;
+  isSeeking = true;
+  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  if (dur > 0) {
+    progressFill.style.width = (pos / dur * 100) + "%";
+  }
+  timeElapsed.textContent = formatTime(pos);
+  api("/api/seek", "POST", { position: pos }).catch(e => showToast(e.message, true));
+  setTimeout(() => isSeeking = false, 1500);
+});
+
+videoPlayer.addEventListener("pause", () => {
+  if (!currentStreamUrl || currentState === "PAUSED" || currentState === "IDLE") return;
+  optimisticState("PAUSED");
+  updatePlayPauseIcon();
+  api("/api/pause", "POST").catch(e => showToast(e.message, true));
+});
+
+videoPlayer.addEventListener("play", () => {
+  if (!currentStreamUrl || currentState === "PLAYING") return;
+  optimisticState("PLAYING");
+  updatePlayPauseIcon();
+  api("/api/play", "POST").catch(e => showToast(e.message, true));
 });
 
 // Volume
@@ -712,15 +784,25 @@ muteBtn.addEventListener("click", (e) => {
     .catch(e => showToast(e.message, true));
 });
 
-// Fullscreen
+// Fullscreen (with iOS/webkit fallbacks)
 const fsBtn = $("fsBtn");
+
+function toggleFullscreen() {
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  } else if (videoWrap.requestFullscreen) {
+    videoWrap.requestFullscreen().catch(() => {});
+  } else if (videoWrap.webkitRequestFullscreen) {
+    videoWrap.webkitRequestFullscreen();
+  } else if (videoPlayer.webkitEnterFullscreen) {
+    // iOS Safari — only supports fullscreen on <video>
+    videoPlayer.webkitEnterFullscreen();
+  }
+}
+
 fsBtn.addEventListener("click", (e) => {
   e.stopPropagation();
-  if (document.fullscreenElement) {
-    document.exitFullscreen();
-  } else {
-    videoWrap.requestFullscreen().catch(() => {});
-  }
+  toggleFullscreen();
 });
 
 // Seek tooltip on progress bar hover
@@ -752,6 +834,7 @@ progressBar.addEventListener("click", (e) => {
     isSeeking = true;
     progressFill.style.width = (pct * 100) + "%";
     timeElapsed.textContent = formatTime(pos);
+    programmaticSeek = true;
     videoPlayer.currentTime = pos;
     api("/api/seek", "POST", { position: pos })
       .catch(e2 => showToast(e2.message, true));
@@ -793,6 +876,7 @@ function handleStatus(s) {
       videoPlayer.src = s.stream_url;
       videoTitle.textContent = s.title || "Now Playing";
       videoSection.style.display = "block";
+      programmaticSeek = true;
       videoPlayer.currentTime = s.current_time || 0;
       if (s.state === "PLAYING") videoPlayer.play().catch(() => {});
     }
@@ -805,6 +889,7 @@ function handleStatus(s) {
       // Only correct if local video is behind the Chromecast by >2s
       const drift = s.current_time - videoPlayer.currentTime;
       if (drift > 2) {
+        programmaticSeek = true;
         videoPlayer.currentTime = s.current_time;
       }
       if (s.state === "PLAYING" && videoPlayer.paused) {
@@ -836,6 +921,128 @@ evtSource.onerror = () => { statusBar.textContent = "Connection lost — reconne
 // Allow casting with Enter key
 urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") castBtn.click();
+});
+
+// Keyboard shortcuts (YouTube-style)
+document.addEventListener("keydown", (e) => {
+  // Don't capture when typing in input fields
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT") return;
+  // Don't capture with modifiers (let browser shortcuts work)
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  // Only act if video is active
+  if (!currentStreamUrl) return;
+
+  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  let handled = true;
+
+  function doSeek(delta) {
+    const cur = videoPlayer.currentTime || 0;
+    const pos = Math.max(0, Math.min(dur, cur + delta));
+    isSeeking = true;
+    progressFill.style.width = (dur > 0 ? pos / dur * 100 : 0) + "%";
+    timeElapsed.textContent = formatTime(pos);
+    programmaticSeek = true;
+    videoPlayer.currentTime = pos;
+    api("/api/seek", "POST", { position: pos }).catch(e2 => showToast(e2.message, true));
+    setTimeout(() => isSeeking = false, 1500);
+  }
+
+  function doVolume(delta) {
+    const cur = parseInt(volumeSlider.value);
+    const next = Math.max(0, Math.min(100, cur + delta));
+    volumeSlider.value = next;
+    volumePct.textContent = next + "%";
+    volumeChanging = true;
+    clearTimeout(volumeTimeout);
+    volumeTimeout = setTimeout(() => {
+      api("/api/volume", "POST", { level: next / 100 }).catch(e2 => showToast(e2.message, true));
+      volumeChanging = false;
+    }, 200);
+  }
+
+  switch (e.key) {
+    // Play/Pause — Space or K
+    case " ":
+    case "k":
+      playPauseZone.click();
+      break;
+
+    // Seek — Arrow keys, J/L
+    case "ArrowLeft":
+      doSeek(-5);
+      showControls();
+      break;
+    case "ArrowRight":
+      doSeek(5);
+      showControls();
+      break;
+    case "j":
+      doSeek(-10);
+      showControls();
+      break;
+    case "l":
+      doSeek(10);
+      showControls();
+      break;
+
+    // Volume — Arrow up/down
+    case "ArrowUp":
+      doVolume(5);
+      showControls();
+      break;
+    case "ArrowDown":
+      doVolume(-5);
+      showControls();
+      break;
+
+    // Mute — M
+    case "m":
+      muteBtn.click();
+      showControls();
+      break;
+
+    // Fullscreen — F
+    case "f":
+      toggleFullscreen();
+      break;
+
+    // Stop — S  (Shift+S to avoid accidental)
+    case "S":
+      stopBtn.click();
+      break;
+
+    // Jump to percentage — 0-9
+    case "0": case "1": case "2": case "3": case "4":
+    case "5": case "6": case "7": case "8": case "9":
+      if (dur > 0) {
+        const pct = parseInt(e.key) / 10;
+        const pos = pct * dur;
+        isSeeking = true;
+        progressFill.style.width = (pct * 100) + "%";
+        timeElapsed.textContent = formatTime(pos);
+        programmaticSeek = true;
+        videoPlayer.currentTime = pos;
+        api("/api/seek", "POST", { position: pos }).catch(e2 => showToast(e2.message, true));
+        setTimeout(() => isSeeking = false, 1500);
+        showControls();
+      }
+      break;
+
+    // Home/End — jump to start/end
+    case "Home":
+      doSeek(-videoPlayer.currentTime);
+      showControls();
+      break;
+    case "End":
+      if (dur > 0) doSeek(dur - videoPlayer.currentTime - 1);
+      showControls();
+      break;
+
+    default:
+      handled = false;
+  }
+
+  if (handled) e.preventDefault();
 });
 
 // Load saved state (URL + devices + playback) on startup
