@@ -265,6 +265,14 @@
     overflow: visible;
     transition: height 0.15s;
   }
+  .progress-bar::before {
+    content: "";
+    position: absolute;
+    top: -10px;
+    bottom: -10px;
+    left: 0;
+    right: 0;
+  }
   .video-controls.active .progress-bar { height: 6px; }
 
   .seek-tooltip {
@@ -326,22 +334,34 @@
     width: 60px;
     -webkit-appearance: none;
     appearance: none;
+    height: 24px;
+    background: transparent;
+    outline: none;
+    cursor: pointer;
+  }
+  .vol-group input[type="range"]::-webkit-slider-runnable-track {
     height: 3px;
     background: rgba(255,255,255,0.2);
     border-radius: 2px;
-    outline: none;
   }
   .vol-group input[type="range"]::-webkit-slider-thumb {
     -webkit-appearance: none;
-    width: 10px;
-    height: 10px;
+    width: 14px;
+    height: 14px;
     background: #fff;
     border-radius: 50%;
     cursor: pointer;
+    margin-top: -5.5px;
+  }
+  .vol-group input[type="range"]::-moz-range-track {
+    height: 3px;
+    background: rgba(255,255,255,0.2);
+    border-radius: 2px;
+    border: none;
   }
   .vol-group input[type="range"]::-moz-range-thumb {
-    width: 10px;
-    height: 10px;
+    width: 14px;
+    height: 14px;
     background: #fff;
     border-radius: 50%;
     border: none;
@@ -416,7 +436,7 @@
       <select id="deviceSelect">
         <option value="">-- Click Scan to find devices --</option>
       </select>
-      <button class="btn-icon btn-secondary" id="scanBtn" title="Scan for devices">&#x1F50D;</button>
+      <button type="button" class="btn-icon btn-secondary" id="scanBtn" title="Scan for devices">&#x1F50D;</button>
     </div>
   </div>
 
@@ -426,8 +446,8 @@
     <div class="row">
       <input type="text" id="urlInput" placeholder="Paste a video URL (YouTube, Vimeo, etc.) or select a local file" />
       <input type="file" id="fileInput" accept="video/*" style="display:none" />
-      <button class="btn-icon btn-secondary" id="fileBtn" title="Select local file">&#x1F4C1;</button>
-      <button id="castBtn">Cast</button>
+      <button type="button" class="btn-icon btn-secondary" id="fileBtn" title="Select local file">&#x1F4C1;</button>
+      <button type="button" id="castBtn">Cast</button>
     </div>
   </div>
 
@@ -442,16 +462,16 @@
       <div class="video-controls" id="videoControls">
         <div class="ctrl-top">
           <span class="status-text" id="statusBar">Not connected</span>
-          <button class="stop-btn" id="stopBtn" title="Stop">&#x23F9;</button>
+          <button type="button" class="stop-btn" id="stopBtn" title="Stop">&#x23F9;</button>
         </div>
         <div class="ctrl-mid">
-          <button class="ctrl-btn" data-skip="-10" title="Rewind 10s">
+          <button type="button" class="ctrl-btn" data-skip="-10" title="Rewind 10s">
             <span class="skip-arrow">&#x21BA;</span><span class="skip-label">10</span>
           </button>
-          <button class="ctrl-btn play-btn" id="playPauseZone" title="Play / Pause">
+          <button type="button" class="ctrl-btn play-btn" id="playPauseZone" title="Play / Pause">
             <span id="playPauseIcon">&#x25B6;</span>
           </button>
-          <button class="ctrl-btn" data-skip="10" title="Forward 10s">
+          <button type="button" class="ctrl-btn" data-skip="10" title="Forward 10s">
             <span class="skip-arrow">&#x21BB;</span><span class="skip-label">10</span>
           </button>
         </div>
@@ -463,11 +483,11 @@
           <div class="bottom-row">
             <span class="progress-times"><span id="timeElapsed">0:00</span> / <span id="timeDuration">0:00</span></span>
             <div class="vol-group">
-              <button class="vol-icon" id="muteBtn" title="Mute">&#x1F509;</button>
+              <button type="button" class="vol-icon" id="muteBtn" title="Mute">&#x1F509;</button>
               <input type="range" id="volumeSlider" min="0" max="100" value="50" />
               <span class="vol-pct" id="volumePct">50%</span>
             </div>
-            <button class="fs-btn" id="fsBtn" title="Fullscreen">&#x26F6;</button>
+            <button type="button" class="fs-btn" id="fsBtn" title="Fullscreen">&#x26F6;</button>
           </div>
         </div>
       </div>
@@ -506,7 +526,9 @@ const toast = $("toast");
 
 let currentState = "IDLE";
 let isSeeking = false;
-let programmaticSeek = false;  // true when we set currentTime from code
+let lastSeekTime = 0;          // timestamp of last seek — suppress pause events shortly after
+let programmaticSeek = false;  // true when our controls set currentTime (already sent to cast)
+let sseSyncCount = 0;          // incremented when SSE mirror sets currentTime
 let volumeChanging = false;
 let currentStreamUrl = "";
 let lastCastTime = 0;     // latest current_time from Chromecast
@@ -594,6 +616,7 @@ fileInput.addEventListener("change", async () => {
       currentStreamUrl = data.stream_url;
       videoPlayer.src = data.stream_url;
       videoTitle.textContent = data.title || "Now Playing";
+      document.title = data.title || "YT Chromecast";
       videoSection.style.display = "block";
     }
   } catch (e) {
@@ -625,6 +648,7 @@ castBtn.addEventListener("click", async () => {
       currentStreamUrl = data.stream_url;
       videoPlayer.src = data.stream_url;
       videoTitle.textContent = data.title || "Now Playing";
+      document.title = data.title || "YT Chromecast";
       videoSection.style.display = "block";
       if (data.start_time > 0) {
         programmaticSeek = true;
@@ -751,7 +775,6 @@ document.querySelectorAll(".ctrl-btn[data-skip]").forEach(zone => {
     const dur = parseFloat(timeDuration.dataset.raw || 0);
     const cur = videoPlayer.currentTime || 0;
     const pos = Math.max(0, Math.min(dur, cur + delta));
-    isSeeking = true;
     const pct = dur > 0 ? (pos / dur * 100) : 0;
     progressFill.style.width = pct + "%";
     timeElapsed.textContent = formatTime(pos);
@@ -759,7 +782,6 @@ document.querySelectorAll(".ctrl-btn[data-skip]").forEach(zone => {
     videoPlayer.currentTime = pos;
     api("/api/seek", "POST", { position: pos })
       .catch(e2 => showToast(e2.message, true));
-    setTimeout(() => isSeeking = false, 1500);
   });
 });
 
@@ -769,8 +791,10 @@ stopBtn.addEventListener("click", (e) => {
   optimisticState("IDLE");
   videoPlayer.pause();
   videoPlayer.removeAttribute("src");
+  videoPlayer.load();
   videoSection.style.display = "none";
   currentStreamUrl = "";
+  document.title = "YT Chromecast";
   updatePlayPauseIcon();
   api("/api/stop", "POST").catch(e => showToast(e.message, true));
 });
@@ -786,19 +810,21 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-// Sync native video controls (iOS fullscreen) back to Chromecast
+// Track browser seeking state
+videoPlayer.addEventListener("seeking", () => { isSeeking = true; });
 videoPlayer.addEventListener("seeked", () => {
-  if (programmaticSeek) { programmaticSeek = false; return; }
+  isSeeking = false;
+  lastSeekTime = Date.now();
+  if (sseSyncCount > 0) { sseSyncCount--; return; }  // SSE mirror sync — don't echo back
+  if (programmaticSeek) { programmaticSeek = false; return; }  // our controls — already sent
   if (!currentStreamUrl) return;
   const pos = videoPlayer.currentTime;
-  isSeeking = true;
   const dur = parseFloat(timeDuration.dataset.raw || 0);
   if (dur > 0) {
     progressFill.style.width = (pos / dur * 100) + "%";
   }
   timeElapsed.textContent = formatTime(pos);
   api("/api/seek", "POST", { position: pos }).catch(e => showToast(e.message, true));
-  setTimeout(() => isSeeking = false, 1500);
 });
 
 // Only forward native pause/play to Chromecast when in fullscreen
@@ -811,6 +837,7 @@ function isFullscreen() {
 videoPlayer.addEventListener("pause", () => {
   if (!isFullscreen()) return;
   if (!currentStreamUrl || isSeeking || programmaticSeek) return;
+  if (Date.now() - lastSeekTime < 2000) return;  // suppress pause fired after seek
   if (currentState === "PAUSED" || currentState === "IDLE") return;
   optimisticState("PAUSED");
   updatePlayPauseIcon();
@@ -903,14 +930,12 @@ progressBar.addEventListener("click", (e) => {
   const dur = parseFloat(timeDuration.dataset.raw || 0);
   if (dur > 0) {
     const pos = pct * dur;
-    isSeeking = true;
     progressFill.style.width = (pct * 100) + "%";
     timeElapsed.textContent = formatTime(pos);
     programmaticSeek = true;
     videoPlayer.currentTime = pos;
     api("/api/seek", "POST", { position: pos })
       .catch(e2 => showToast(e2.message, true));
-    setTimeout(() => isSeeking = false, 1500);
   }
 });
 
@@ -947,8 +972,9 @@ function handleStatus(s) {
       currentStreamUrl = s.stream_url;
       videoPlayer.src = s.stream_url;
       videoTitle.textContent = s.title || "Now Playing";
+      document.title = s.title || "YT Chromecast";
       videoSection.style.display = "block";
-      programmaticSeek = true;
+      sseSyncCount++;
       videoPlayer.currentTime = s.current_time || 0;
       if (s.state === "PLAYING") videoPlayer.play().catch(() => {});
     }
@@ -956,13 +982,17 @@ function handleStatus(s) {
     // Track Chromecast position for resync
     lastCastTime = s.current_time || 0;
 
-    // Mirror Chromecast: just copy its position and state
+    // Mirror Chromecast: sync position and state
     if (currentStreamUrl && !isSeeking) {
-      programmaticSeek = true;
-      videoPlayer.currentTime = s.current_time;
+      // Only correct position if drift > 1s to avoid constant seeking
+      const drift = Math.abs(s.current_time - videoPlayer.currentTime);
+      if (drift > 1) {
+        sseSyncCount++;
+        videoPlayer.currentTime = s.current_time;
+      }
       if (s.state === "PLAYING" && videoPlayer.paused) {
         videoPlayer.play().catch(() => {});
-      } else if (s.state !== "PLAYING" && !videoPlayer.paused) {
+      } else if (s.state === "PAUSED" && !videoPlayer.paused) {
         videoPlayer.pause();
       }
     }
@@ -973,23 +1003,30 @@ function handleStatus(s) {
       if (currentStreamUrl) {
         videoPlayer.pause();
         videoPlayer.removeAttribute("src");
+        videoPlayer.load();
         videoSection.style.display = "none";
         currentStreamUrl = "";
+        document.title = "YT Chromecast";
       }
     }
   }
 }
 
-const evtSource = new EventSource("/api/events");
-evtSource.onmessage = (e) => {
-  try { handleStatus(JSON.parse(e.data)); } catch {}
-};
-evtSource.onerror = () => { statusBar.textContent = "Connection lost — reconnecting..."; };
+// Defer SSE connection so iOS Safari doesn't show infinite loading spinner
+let evtSource;
+window.addEventListener("load", () => {
+  evtSource = new EventSource("/api/events");
+  evtSource.onmessage = (e) => {
+    try { handleStatus(JSON.parse(e.data)); } catch {}
+  };
+  evtSource.onerror = () => { statusBar.textContent = "Connection lost — reconnecting..."; };
+});
 
 // Allow casting with Enter key
 urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") castBtn.click();
 });
+urlInput.addEventListener("focus", () => setTimeout(() => urlInput.select(), 0));
 
 // Keyboard shortcuts (YouTube-style)
 document.addEventListener("keydown", (e) => {
@@ -1006,13 +1043,11 @@ document.addEventListener("keydown", (e) => {
   function doSeek(delta) {
     const cur = videoPlayer.currentTime || 0;
     const pos = Math.max(0, Math.min(dur, cur + delta));
-    isSeeking = true;
     progressFill.style.width = (dur > 0 ? pos / dur * 100 : 0) + "%";
     timeElapsed.textContent = formatTime(pos);
     programmaticSeek = true;
     videoPlayer.currentTime = pos;
     api("/api/seek", "POST", { position: pos }).catch(e2 => showToast(e2.message, true));
-    setTimeout(() => isSeeking = false, 1500);
   }
 
   function doVolume(delta) {
@@ -1085,13 +1120,11 @@ document.addEventListener("keydown", (e) => {
       if (dur > 0) {
         const pct = parseInt(e.key) / 10;
         const pos = pct * dur;
-        isSeeking = true;
         progressFill.style.width = (pct * 100) + "%";
         timeElapsed.textContent = formatTime(pos);
         programmaticSeek = true;
         videoPlayer.currentTime = pos;
         api("/api/seek", "POST", { position: pos }).catch(e2 => showToast(e2.message, true));
-        setTimeout(() => isSeeking = false, 1500);
         showControls();
       }
       break;
@@ -1118,16 +1151,20 @@ document.addEventListener("keydown", (e) => {
   try {
     const s = await api("/api/state", "GET");
     if (s.url) urlInput.value = s.url;
+
+    // Show cached devices immediately, then verify with a scan
+    const lastUuid = s.device_uuid;
     if (s.devices && s.devices.length > 0) {
       deviceSelect.innerHTML = "";
       s.devices.forEach(d => {
         const opt = document.createElement("option");
         opt.value = d.uuid;
         opt.textContent = d.friendly_name + (d.model_name ? " (" + d.model_name + ")" : "");
-        if (d.uuid === s.device_uuid) opt.selected = true;
+        if (d.uuid === lastUuid) opt.selected = true;
         deviceSelect.appendChild(opt);
       });
     }
+
     // Restore active playback
     if (s.playback && s.playback.connected && s.playback.state !== "IDLE" && s.playback.state !== "UNKNOWN") {
       handleStatus(s.playback);

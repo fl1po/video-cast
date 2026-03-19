@@ -79,8 +79,8 @@ def load_state():
 
 
 def try_reconnect():
-    """Try to reconnect to the last used Chromecast on startup."""
-    global cast_device
+    """Try to reconnect to the last used Chromecast on startup and resume playback."""
+    global cast_device, media_stream_url, media_title, media_thumbnail, chromecasts, last_device_uuid, cached_devices
     if not last_device_uuid or not cached_devices:
         return
     # Find friendly name for the last device
@@ -92,18 +92,52 @@ def try_reconnect():
     if not name:
         return
     try:
-        casts, browser = pychromecast.get_listed_chromecasts(friendly_names=[name])
+        # Quick discovery with timeout — don't hang if device is off
+        services, browser = pychromecast.discovery.discover_chromecasts()
+        time.sleep(5)
+        pychromecast.discovery.stop_discovery(browser)
+        chromecasts = services
+
+        # Update cached_devices to only include available devices
+        available = []
+        for service in services:
+            available.append({
+                "uuid": str(service.uuid),
+                "friendly_name": service.friendly_name,
+                "host": service.host,
+                "port": service.port,
+                "model_name": service.model_name,
+            })
+        cached_devices = available
+
+        # Check if last device is still on the network
+        found = any(str(s.uuid) == last_device_uuid for s in services)
+        if not found:
+            last_device_uuid = ""
+            save_state()
+            return
+
+        save_state()
+
+        # Connect to the last used device
+        casts, browser2 = pychromecast.get_listed_chromecasts(friendly_names=[name])
         if casts:
             cast_device = casts[0]
             cast_device.wait(timeout=10)
             register_listeners(cast_device)
-            # Check if it's actually playing something
+            # Check if Chromecast is already playing something
             ms = cast_device.media_controller.status
             if ms.player_state in (None, "UNKNOWN", "IDLE"):
-                pass  # connected but nothing playing — that's fine
-        pychromecast.discovery.stop_discovery(browser)
+                # Not playing — try to resume if we have saved state
+                if last_url and last_position > 0:
+                    threading.Thread(target=auto_resume, daemon=True).start()
+        else:
+            last_device_uuid = ""
+            save_state()
+        pychromecast.discovery.stop_discovery(browser2)
     except Exception:
-        pass
+        last_device_uuid = ""
+        save_state()
 
 
 load_state()
@@ -161,18 +195,46 @@ def broadcast_status():
 
 
 _resume_lock = threading.Lock()
+_last_resume_attempt = 0
+
+
+def extract_stream_url(url):
+    """Re-extract a fresh stream URL from the original video URL using yt-dlp."""
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "yt_dlp",
+            "--no-warnings",
+            "-f", "best[ext=mp4]/best",
+            "-j",
+            url,
+        ],
+        capture_output=True, text=True, timeout=30, encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return None, None, None
+    try:
+        info = json.loads(result.stdout)
+        return info.get("url", ""), info.get("title", "Unknown"), info.get("thumbnail", "")
+    except json.JSONDecodeError:
+        return None, None, None
 
 
 def auto_resume():
     """Re-cast the last stream and seek to saved position after TV wakes."""
-    global cast_device, intentional_stop
+    global cast_device, intentional_stop, _last_resume_attempt, media_stream_url, media_title, media_thumbnail
     if not _resume_lock.acquire(blocking=False):
         return  # another resume already in progress
     try:
+        # Cooldown: don't retry within 30 seconds
+        now = time.time()
+        if now - _last_resume_attempt < 30:
+            return
+        _last_resume_attempt = now
+
         # Wait a moment for the device to fully wake
         time.sleep(5)
         cc = cast_device
-        if not cc or not media_stream_url:
+        if not cc or not last_url:
             return
         # Check if still idle (wasn't manually restarted)
         try:
@@ -181,13 +243,24 @@ def auto_resume():
                 return  # already recovered on its own
         except Exception:
             pass
+
+        # Re-extract fresh stream URL (old one likely expired)
+        stream_url, title, thumb = extract_stream_url(last_url)
+        if not stream_url:
+            intentional_stop = True
+            return
+
+        media_stream_url = stream_url
+        media_title = title
+        media_thumbnail = thumb
+
         # Re-cast
         mc = cc.media_controller
         mc.play_media(
-            media_stream_url,
+            stream_url,
             "video/mp4",
-            title=media_title or "",
-            thumb=media_thumbnail or "",
+            title=title or "",
+            thumb=thumb or "",
         )
         mc.block_until_active(timeout=30)
         # Seek to last position
@@ -196,7 +269,8 @@ def auto_resume():
         status_changed.set()
         save_state()
     except Exception:
-        pass
+        # Stop retrying on failure
+        intentional_stop = True
     finally:
         _resume_lock.release()
 
@@ -218,8 +292,13 @@ class MediaStatusListener:
                 last_position = pos
                 intentional_stop = False
         # Auto-resume if cast went idle unexpectedly (TV sleep/wake)
-        elif status.player_state == "IDLE" and not intentional_stop and media_stream_url:
-            threading.Thread(target=auto_resume, daemon=True).start()
+        # But NOT if video ended naturally (position near duration)
+        elif status.player_state == "IDLE" and not intentional_stop and last_url:
+            duration = status.duration or 0
+            if duration > 0 and last_position > 0 and (duration - last_position) < 5:
+                intentional_stop = True  # video finished naturally
+            else:
+                threading.Thread(target=auto_resume, daemon=True).start()
         status_changed.set()
 
 
@@ -231,10 +310,19 @@ def register_listeners(cc):
 
 def sse_broadcaster():
     """Background thread: pushes status to SSE clients.
-    Wakes on pychromecast events or every 1s for time updates."""
+    Wakes on pychromecast events or periodically for time updates."""
     while True:
-        # Wait up to 1s — wakes early if pychromecast fires an event
-        status_changed.wait(timeout=1)
+        # Poll faster during playback (2s), slower when idle (5s)
+        cc = cast_device
+        if cc:
+            try:
+                state = cc.media_controller.status.player_state
+                timeout = 2 if state == "PLAYING" else 5
+            except Exception:
+                timeout = 5
+        else:
+            timeout = 5
+        status_changed.wait(timeout=timeout)
         status_changed.clear()
         broadcast_status()
 
@@ -243,8 +331,8 @@ def sse_broadcaster():
 _broadcaster = threading.Thread(target=sse_broadcaster, daemon=True)
 _broadcaster.start()
 
-# Try reconnecting to last Chromecast on startup
-try_reconnect()
+# Try reconnecting to last Chromecast in background (don't block startup)
+threading.Thread(target=try_reconnect, daemon=True).start()
 
 
 @app.route("/")
@@ -308,9 +396,7 @@ def scan():
     global chromecasts, cached_devices
     try:
         services, browser = pychromecast.discovery.discover_chromecasts()
-        # Give discovery a moment to find devices
-        time.sleep(3)
-        services, browser = pychromecast.discovery.discover_chromecasts()
+        time.sleep(5)
         pychromecast.discovery.stop_discovery(browser)
 
         chromecasts_found = []
@@ -368,46 +454,43 @@ def cast():
     last_url = url
     last_device_uuid = device_uuid
 
-    # Find the selected device
-    target_service = None
-    for service in chromecasts:
-        if str(service.uuid) == device_uuid:
-            target_service = service
+    # Find the device name from cached devices or live services
+    device_name = None
+    for d in cached_devices:
+        if d.get("uuid") == device_uuid:
+            device_name = d.get("friendly_name")
             break
-
-    if not target_service:
+    if not device_name:
+        for service in chromecasts:
+            if str(service.uuid) == device_uuid:
+                device_name = service.friendly_name
+                break
+    if not device_name:
         return jsonify({"error": "Device not found. Try scanning again."}), 404
 
-    # Extract stream URL with yt-dlp
+    # Extract stream URL with yt-dlp (use JSON output for proper Unicode support)
     try:
         result = subprocess.run(
             [
                 sys.executable, "-m", "yt_dlp",
                 "--no-warnings",
                 "-f", "best[ext=mp4]/best",
-                "--get-url",
-                "--get-title",
-                "--get-thumbnail",
+                "-j",
                 url,
             ],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, encoding="utf-8",
         )
         if result.returncode != 0:
-            return jsonify({"error": f"yt-dlp failed: {result.stderr.strip()}"}), 500
+            stderr = result.stderr or ""
+            return jsonify({"error": f"yt-dlp failed: {stderr.strip()}"}), 500
 
-        lines = result.stdout.strip().split("\n")
-        if len(lines) < 1:
-            return jsonify({"error": "yt-dlp returned no output"}), 500
+        info = json.loads(result.stdout)
+        video_title = info.get("title", "Unknown")
+        stream_url = info.get("url", "")
+        thumbnail_url = info.get("thumbnail", "")
 
-        video_title = lines[0] if len(lines) >= 1 else "Unknown"
-        stream_url = lines[1] if len(lines) >= 2 else lines[0]
-        thumbnail_url = lines[2] if len(lines) >= 3 else ""
-
-        # If only one line, it's probably the URL
-        if len(lines) == 1:
-            stream_url = lines[0]
-            video_title = "Unknown"
-            thumbnail_url = ""
+        if not stream_url:
+            return jsonify({"error": "yt-dlp returned no stream URL"}), 500
 
     except subprocess.TimeoutExpired:
         return jsonify({"error": "yt-dlp timed out"}), 504
@@ -425,11 +508,11 @@ def cast():
             cast_device = None
 
         casts, browser = pychromecast.get_listed_chromecasts(
-            friendly_names=[target_service.friendly_name]
+            friendly_names=[device_name]
         )
         if not casts:
             pychromecast.discovery.stop_discovery(browser)
-            return jsonify({"error": "Could not connect to Chromecast"}), 500
+            return jsonify({"error": "Could not connect to Chromecast. Is it on?"}), 500
 
         cast_device = casts[0]
         cast_device.wait(timeout=30)
@@ -526,14 +609,18 @@ def cast_file():
     last_url = file.filename
     last_device_uuid = device_uuid
 
-    # Find the selected device
-    target_service = None
-    for service in chromecasts:
-        if str(service.uuid) == device_uuid:
-            target_service = service
+    # Find the device name from cached devices or live services
+    device_name = None
+    for d in cached_devices:
+        if d.get("uuid") == device_uuid:
+            device_name = d.get("friendly_name")
             break
-
-    if not target_service:
+    if not device_name:
+        for service in chromecasts:
+            if str(service.uuid) == device_uuid:
+                device_name = service.friendly_name
+                break
+    if not device_name:
         return jsonify({"error": "Device not found. Try scanning again."}), 404
 
     # Connect to Chromecast
@@ -546,11 +633,11 @@ def cast_file():
             cast_device = None
 
         casts, browser = pychromecast.get_listed_chromecasts(
-            friendly_names=[target_service.friendly_name]
+            friendly_names=[device_name]
         )
         if not casts:
             pychromecast.discovery.stop_discovery(browser)
-            return jsonify({"error": "Could not connect to Chromecast"}), 500
+            return jsonify({"error": "Could not connect to Chromecast. Is it on?"}), 500
 
         cast_device = casts[0]
         cast_device.wait(timeout=30)
@@ -645,10 +732,18 @@ def seek():
     position = data.get("position")
     if position is None:
         return jsonify({"error": "No position provided"}), 400
-    cc.media_controller.seek(float(position))
+    mc = cc.media_controller
+    mc.seek(float(position))
+    # Some Chromecasts pause after seek — resume playback
+    time.sleep(0.3)
+    try:
+        if mc.status and mc.status.player_state in ("PAUSED", "BUFFERING"):
+            mc.play()
+    except Exception:
+        pass
     status_changed.set()
     return jsonify({"position": position})
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
