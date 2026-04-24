@@ -11,7 +11,12 @@ import mimetypes
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, render_template, request, jsonify, Response, send_file
-import pychromecast
+pimport pychromecast
+
+# Ensure deno is on PATH for yt-dlp JS challenge solving
+_deno_path = os.path.join(os.path.expanduser("~"), ".deno", "bin")
+if os.path.isdir(_deno_path) and _deno_path not in os.environ.get("PATH", ""):
+    os.environ["PATH"] = _deno_path + os.pathsep + os.environ.get("PATH", "")
 
 app = Flask(__name__)
 
@@ -42,6 +47,53 @@ last_device_uuid = ""
 cached_devices = []
 last_position = 0        # last known playback position
 intentional_stop = False  # True when user clicks Stop
+_casting_in_progress = False  # True while a new cast is being set up
+
+YT_DLP_FORMAT = "18/best[ext=mp4][protocol!=m3u8_native][protocol!=m3u8]/best[ext=mp4]/best"
+YT_DLP_BASE = [
+    sys.executable, "-m", "yt_dlp",
+    "--no-warnings",
+    "--remote-components", "ejs:github",
+    "--cookies-from-browser", "firefox",
+    "-f", YT_DLP_FORMAT,
+    "-j",
+]
+
+
+def get_device_name(device_uuid):
+    """Find device friendly name by UUID from cache or live services."""
+    for d in cached_devices:
+        if d.get("uuid") == device_uuid:
+            return d.get("friendly_name")
+    for service in chromecasts:
+        if str(service.uuid) == device_uuid:
+            return service.friendly_name
+    return None
+
+
+def connect_to_device(device_name):
+    """Clean up old connection and establish a fresh one. Returns (device, error_msg)."""
+    global cast_device
+    if cast_device:
+        try:
+            cast_device.quit_app()
+            time.sleep(2)
+            cast_device.disconnect(timeout=5)
+        except Exception:
+            pass
+        cast_device = None
+        time.sleep(3)
+
+    casts, browser = pychromecast.get_listed_chromecasts(friendly_names=[device_name])
+    if not casts:
+        pychromecast.discovery.stop_discovery(browser)
+        return None, "Could not connect to Chromecast. Is it on?"
+
+    cast_device = casts[0]
+    cast_device.wait(timeout=30)
+    pychromecast.discovery.stop_discovery(browser)
+    register_listeners(cast_device)
+    return cast_device, None
 
 
 def save_state():
@@ -79,20 +131,11 @@ def load_state():
 
 
 def try_reconnect():
-    """Try to reconnect to the last used Chromecast on startup and resume playback."""
-    global cast_device, media_stream_url, media_title, media_thumbnail, chromecasts, last_device_uuid, cached_devices
+    """Discover available Chromecasts on startup (does NOT connect — avoids putting device in bad state)."""
+    global chromecasts, last_device_uuid, cached_devices
     if not last_device_uuid or not cached_devices:
         return
-    # Find friendly name for the last device
-    name = None
-    for d in cached_devices:
-        if d.get("uuid") == last_device_uuid:
-            name = d.get("friendly_name")
-            break
-    if not name:
-        return
     try:
-        # Quick discovery with timeout — don't hang if device is off
         services, browser = pychromecast.discovery.discover_chromecasts()
         time.sleep(5)
         pychromecast.discovery.stop_discovery(browser)
@@ -114,30 +157,10 @@ def try_reconnect():
         found = any(str(s.uuid) == last_device_uuid for s in services)
         if not found:
             last_device_uuid = ""
-            save_state()
-            return
 
         save_state()
-
-        # Connect to the last used device
-        casts, browser2 = pychromecast.get_listed_chromecasts(friendly_names=[name])
-        if casts:
-            cast_device = casts[0]
-            cast_device.wait(timeout=10)
-            register_listeners(cast_device)
-            # Check if Chromecast is already playing something
-            ms = cast_device.media_controller.status
-            if ms.player_state in (None, "UNKNOWN", "IDLE"):
-                # Not playing — try to resume if we have saved state
-                if last_url and last_position > 0:
-                    threading.Thread(target=auto_resume, daemon=True).start()
-        else:
-            last_device_uuid = ""
-            save_state()
-        pychromecast.discovery.stop_discovery(browser2)
     except Exception:
-        last_device_uuid = ""
-        save_state()
+        pass
 
 
 load_state()
@@ -163,7 +186,7 @@ def build_status():
             "state": ms.player_state or "UNKNOWN",
             "title": media_title or ms.title or "",
             "thumbnail": media_thumbnail or "",
-            "stream_url": media_stream_url or "",
+            "stream_url": media_stream_url if media_stream_url and "m3u8" not in (media_stream_url or "") else "",
             "current_time": ms.adjusted_current_time or ms.current_time or 0,
             "duration": ms.duration or 0,
             "volume": cc.status.volume_level if cc.status else 0,
@@ -201,29 +224,26 @@ _last_resume_attempt = 0
 def extract_stream_url(url):
     """Re-extract a fresh stream URL from the original video URL using yt-dlp."""
     result = subprocess.run(
-        [
-            sys.executable, "-m", "yt_dlp",
-            "--no-warnings",
-            "-f", "best[ext=mp4]/best",
-            "-j",
-            url,
-        ],
-        capture_output=True, text=True, timeout=30, encoding="utf-8",
+        YT_DLP_BASE + [url],
+        capture_output=True, timeout=60,
     )
     if result.returncode != 0:
-        return None, None, None
+        return None, None, None, None
     try:
-        info = json.loads(result.stdout)
-        return info.get("url", ""), info.get("title", "Unknown"), info.get("thumbnail", "")
-    except json.JSONDecodeError:
-        return None, None, None
+        info = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        protocol = info.get("protocol", "")
+        mime = "application/x-mpegURL" if "m3u8" in protocol else "video/mp4"
+        return info.get("url", ""), info.get("title", "Unknown"), info.get("thumbnail", ""), mime
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None, None, None
 
 
 def auto_resume():
     """Re-cast the last stream and seek to saved position after TV wakes."""
-    global cast_device, intentional_stop, _last_resume_attempt, media_stream_url, media_title, media_thumbnail
+    global cast_device, intentional_stop, _last_resume_attempt, media_stream_url, media_title, media_thumbnail, _casting_in_progress
     if not _resume_lock.acquire(blocking=False):
         return  # another resume already in progress
+    _casting_in_progress = True
     try:
         # Cooldown: don't retry within 30 seconds
         now = time.time()
@@ -245,7 +265,7 @@ def auto_resume():
             pass
 
         # Re-extract fresh stream URL (old one likely expired)
-        stream_url, title, thumb = extract_stream_url(last_url)
+        stream_url, title, thumb, mime = extract_stream_url(last_url)
         if not stream_url:
             intentional_stop = True
             return
@@ -258,7 +278,7 @@ def auto_resume():
         mc = cc.media_controller
         mc.play_media(
             stream_url,
-            "video/mp4",
+            mime or "video/mp4",
             title=title or "",
             thumb=thumb or "",
         )
@@ -272,6 +292,7 @@ def auto_resume():
         # Stop retrying on failure
         intentional_stop = True
     finally:
+        _casting_in_progress = False
         _resume_lock.release()
 
 
@@ -293,7 +314,7 @@ class MediaStatusListener:
                 intentional_stop = False
         # Auto-resume if cast went idle unexpectedly (TV sleep/wake)
         # But NOT if video ended naturally (position near duration)
-        elif status.player_state == "IDLE" and not intentional_stop and last_url:
+        elif status.player_state == "IDLE" and not intentional_stop and not _casting_in_progress and last_url:
             duration = status.duration or 0
             if duration > 0 and last_position > 0 and (duration - last_position) < 5:
                 intentional_stop = True  # video finished naturally
@@ -440,7 +461,7 @@ def parse_timestamp(url):
 @app.route("/api/cast", methods=["POST"])
 def cast():
     """Extract stream URL via yt-dlp and cast to selected Chromecast."""
-    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, intentional_stop, last_position
+    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, intentional_stop, last_position, _casting_in_progress
 
     data = request.json
     url = data.get("url", "").strip()
@@ -454,77 +475,49 @@ def cast():
     last_url = url
     last_device_uuid = device_uuid
 
-    # Find the device name from cached devices or live services
-    device_name = None
-    for d in cached_devices:
-        if d.get("uuid") == device_uuid:
-            device_name = d.get("friendly_name")
-            break
-    if not device_name:
-        for service in chromecasts:
-            if str(service.uuid) == device_uuid:
-                device_name = service.friendly_name
-                break
+    device_name = get_device_name(device_uuid)
     if not device_name:
         return jsonify({"error": "Device not found. Try scanning again."}), 404
 
-    # Extract stream URL with yt-dlp (use JSON output for proper Unicode support)
+    # Direct stream URLs (m3u/m3u8/mp4) — skip yt-dlp
+    url_lower = url.split("?")[0].lower()
+    if url_lower.endswith((".m3u", ".m3u8", ".mp4", ".mkv", ".avi", ".webm")):
+        stream_url = url
+        video_title = url.split("/")[-1].split("?")[0] or "Stream"
+        thumbnail_url = ""
+        stream_mime = "application/x-mpegURL" if url_lower.endswith((".m3u", ".m3u8")) else "video/mp4"
+    else:
+        # Extract stream URL with yt-dlp
+        try:
+            result = subprocess.run(
+                YT_DLP_BASE + [url],
+                capture_output=True, timeout=60,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
+                return jsonify({"error": f"yt-dlp failed: {stderr.strip()}"}), 500
+
+            info = json.loads(result.stdout.decode("utf-8", errors="replace"))
+            video_title = info.get("title", "Unknown")
+            stream_url = info.get("url", "")
+            thumbnail_url = info.get("thumbnail", "")
+            protocol = info.get("protocol", "")
+            stream_mime = "application/x-mpegURL" if "m3u8" in protocol else "video/mp4"
+
+            if not stream_url:
+                return jsonify({"error": "yt-dlp returned no stream URL"}), 500
+
+        except subprocess.TimeoutExpired:
+            return jsonify({"error": "yt-dlp timed out"}), 504
+        except FileNotFoundError:
+            return jsonify({"error": "yt-dlp not found. Install with: pip install yt-dlp"}), 500
+
     try:
-        result = subprocess.run(
-            [
-                sys.executable, "-m", "yt_dlp",
-                "--no-warnings",
-                "-f", "best[ext=mp4]/best",
-                "-j",
-                url,
-            ],
-            capture_output=True, text=True, timeout=30, encoding="utf-8",
-        )
-        if result.returncode != 0:
-            stderr = result.stderr or ""
-            return jsonify({"error": f"yt-dlp failed: {stderr.strip()}"}), 500
-
-        info = json.loads(result.stdout)
-        video_title = info.get("title", "Unknown")
-        stream_url = info.get("url", "")
-        thumbnail_url = info.get("thumbnail", "")
-
-        if not stream_url:
-            return jsonify({"error": "yt-dlp returned no stream URL"}), 500
-
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "yt-dlp timed out"}), 504
-    except FileNotFoundError:
-        return jsonify({"error": "yt-dlp not found. Install with: pip install yt-dlp"}), 500
-
-    # Connect to Chromecast (fresh connection to wake from sleep)
-    try:
-        # Disconnect stale connection if any
-        if cast_device:
-            try:
-                cast_device.disconnect(timeout=5)
-            except Exception:
-                pass
-            cast_device = None
-
-        casts, browser = pychromecast.get_listed_chromecasts(
-            friendly_names=[device_name]
-        )
-        if not casts:
-            pychromecast.discovery.stop_discovery(browser)
-            return jsonify({"error": "Could not connect to Chromecast. Is it on?"}), 500
-
-        cast_device = casts[0]
-        cast_device.wait(timeout=30)
-        pychromecast.discovery.stop_discovery(browser)
-
-        # Register listeners for SSE push
-        register_listeners(cast_device)
-
-        # Wake the device — quit any existing app so it's in a clean state
-        if cast_device.app_id:
-            cast_device.quit_app()
-            time.sleep(2)
+        _casting_in_progress = True
+        cc, err = connect_to_device(device_name)
+        if err:
+            _casting_in_progress = False
+            return jsonify({"error": err}), 500
 
         intentional_stop = False
         last_position = 0
@@ -532,15 +525,10 @@ def cast():
         media_thumbnail = thumbnail_url
         media_stream_url = stream_url
 
-        # Cast the stream
-        mc = cast_device.media_controller
-        mc.play_media(
-            stream_url,
-            "video/mp4",
-            title=video_title,
-            thumb=thumbnail_url,
-        )
+        mc = cc.media_controller
+        mc.play_media(stream_url, stream_mime, title=video_title, thumb=thumbnail_url)
         mc.block_until_active(timeout=30)
+        _casting_in_progress = False
 
         # Seek to timestamp if present in URL
         start_time = parse_timestamp(url)
@@ -568,10 +556,11 @@ def cast():
             "status": "casting",
             "title": video_title,
             "thumbnail": thumbnail_url,
-            "stream_url": stream_url,
+            "stream_url": stream_url if stream_mime == "video/mp4" else "",
             "start_time": start_time,
         })
     except Exception as e:
+        _casting_in_progress = False
         return jsonify({"error": str(e)}), 500
 
 
@@ -582,7 +571,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @app.route("/api/cast_file", methods=["POST"])
 def cast_file():
     """Upload a local file and cast it to Chromecast."""
-    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, local_file_path, intentional_stop, last_position
+    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, local_file_path, intentional_stop, last_position, _casting_in_progress
 
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
@@ -598,56 +587,38 @@ def cast_file():
     # Save uploaded file
     filepath = os.path.join(UPLOAD_DIR, file.filename)
     file.save(filepath)
-    local_file_path = filepath
 
-    video_title = file.filename
-    thumbnail_url = ""
-    lan_ip = get_lan_ip()
-    stream_url = f"http://{lan_ip}:5000/api/media"
-    mime = mimetypes.guess_type(filepath)[0] or "video/mp4"
+    # M3U/M3U8 playlists — read the stream URL from the file
+    if file.filename.lower().endswith((".m3u", ".m3u8")):
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+        if not lines:
+            return jsonify({"error": "No stream URL found in playlist file"}), 400
+        stream_url = lines[0]
+        video_title = file.filename
+        thumbnail_url = ""
+        mime = "application/x-mpegURL"
+    else:
+        local_file_path = filepath
+        video_title = file.filename
+        thumbnail_url = ""
+        lan_ip = get_lan_ip()
+        stream_url = f"http://{lan_ip}:5000/api/media"
+        mime = mimetypes.guess_type(filepath)[0] or "video/mp4"
 
     last_url = file.filename
     last_device_uuid = device_uuid
 
-    # Find the device name from cached devices or live services
-    device_name = None
-    for d in cached_devices:
-        if d.get("uuid") == device_uuid:
-            device_name = d.get("friendly_name")
-            break
-    if not device_name:
-        for service in chromecasts:
-            if str(service.uuid) == device_uuid:
-                device_name = service.friendly_name
-                break
+    device_name = get_device_name(device_uuid)
     if not device_name:
         return jsonify({"error": "Device not found. Try scanning again."}), 404
 
-    # Connect to Chromecast
     try:
-        if cast_device:
-            try:
-                cast_device.disconnect(timeout=5)
-            except Exception:
-                pass
-            cast_device = None
-
-        casts, browser = pychromecast.get_listed_chromecasts(
-            friendly_names=[device_name]
-        )
-        if not casts:
-            pychromecast.discovery.stop_discovery(browser)
-            return jsonify({"error": "Could not connect to Chromecast. Is it on?"}), 500
-
-        cast_device = casts[0]
-        cast_device.wait(timeout=30)
-        pychromecast.discovery.stop_discovery(browser)
-
-        register_listeners(cast_device)
-
-        if cast_device.app_id:
-            cast_device.quit_app()
-            time.sleep(2)
+        _casting_in_progress = True
+        cc, err = connect_to_device(device_name)
+        if err:
+            _casting_in_progress = False
+            return jsonify({"error": err}), 500
 
         intentional_stop = False
         last_position = 0
@@ -655,9 +626,10 @@ def cast_file():
         media_thumbnail = thumbnail_url
         media_stream_url = stream_url
 
-        mc = cast_device.media_controller
+        mc = cc.media_controller
         mc.play_media(stream_url, mime, title=video_title)
         mc.block_until_active(timeout=30)
+        _casting_in_progress = False
 
         status_changed.set()
         save_state()
@@ -668,6 +640,7 @@ def cast_file():
             "stream_url": stream_url,
         })
     except Exception as e:
+        _casting_in_progress = False
         return jsonify({"error": str(e)}), 500
 
 

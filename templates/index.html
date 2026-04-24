@@ -387,6 +387,40 @@
   }
   .fs-btn:hover { color: #fff; background: none; }
 
+  /* Fullscreen — scale up controls for easier navigation */
+  .video-wrap:-webkit-full-screen .progress-bar,
+  .video-wrap:fullscreen .progress-bar { height: 6px; }
+  .video-wrap:-webkit-full-screen .video-controls.active .progress-bar,
+  .video-wrap:fullscreen .video-controls.active .progress-bar { height: 10px; }
+  .video-wrap:-webkit-full-screen .progress-bar::before,
+  .video-wrap:fullscreen .progress-bar::before { top: -14px; bottom: -14px; }
+  .video-wrap:-webkit-full-screen .vol-group input[type="range"],
+  .video-wrap:fullscreen .vol-group input[type="range"] { width: 120px; height: 32px; }
+  .video-wrap:-webkit-full-screen .vol-group input[type="range"]::-webkit-slider-runnable-track,
+  .video-wrap:fullscreen .vol-group input[type="range"]::-webkit-slider-runnable-track { height: 5px; }
+  .video-wrap:-webkit-full-screen .vol-group input[type="range"]::-webkit-slider-thumb,
+  .video-wrap:fullscreen .vol-group input[type="range"]::-webkit-slider-thumb { width: 18px; height: 18px; margin-top: -6.5px; }
+  .video-wrap:-webkit-full-screen .ctrl-btn,
+  .video-wrap:fullscreen .ctrl-btn { width: 48px; height: 48px; font-size: 1.1rem; }
+  .video-wrap:-webkit-full-screen .ctrl-btn.play-btn,
+  .video-wrap:fullscreen .ctrl-btn.play-btn { width: 60px; height: 60px; font-size: 1.6rem; }
+  .video-wrap:-webkit-full-screen .ctrl-mid,
+  .video-wrap:fullscreen .ctrl-mid { gap: 24px; }
+  .video-wrap:-webkit-full-screen .progress-times,
+  .video-wrap:fullscreen .progress-times { font-size: 0.9rem; }
+  .video-wrap:-webkit-full-screen .vol-pct,
+  .video-wrap:fullscreen .vol-pct { font-size: 0.8rem; width: 32px; }
+  .video-wrap:-webkit-full-screen .vol-group .vol-icon,
+  .video-wrap:fullscreen .vol-group .vol-icon { font-size: 1.1rem; }
+  .video-wrap:-webkit-full-screen .fs-btn,
+  .video-wrap:fullscreen .fs-btn { font-size: 1.4rem; }
+  .video-wrap:-webkit-full-screen .stop-btn,
+  .video-wrap:fullscreen .stop-btn { font-size: 1.1rem; padding: 6px 10px; }
+  .video-wrap:-webkit-full-screen .status-text,
+  .video-wrap:fullscreen .status-text { font-size: 0.9rem; }
+  .video-wrap:-webkit-full-screen .video-controls,
+  .video-wrap:fullscreen .video-controls { padding: 16px 24px 12px; }
+
   /* Mobile */
   @media (max-width: 520px) {
     body { padding: 16px 8px; }
@@ -445,7 +479,7 @@
     <label>Video URL</label>
     <div class="row">
       <input type="text" id="urlInput" placeholder="Paste a video URL (YouTube, Vimeo, etc.) or select a local file" />
-      <input type="file" id="fileInput" accept="video/*" style="display:none" />
+      <input type="file" id="fileInput" accept="video/*,.m3u,.m3u8,.mkv,.avi" style="display:none" />
       <button type="button" class="btn-icon btn-secondary" id="fileBtn" title="Select local file">&#x1F4C1;</button>
       <button type="button" id="castBtn">Cast</button>
     </div>
@@ -531,7 +565,6 @@ let programmaticSeek = false;  // true when our controls set currentTime (alread
 let sseSyncCount = 0;          // incremented when SSE mirror sets currentTime
 let volumeChanging = false;
 let currentStreamUrl = "";
-let lastCastTime = 0;     // latest current_time from Chromecast
 
 function showToast(msg, isError) {
   toast.textContent = msg;
@@ -545,6 +578,15 @@ function formatTime(sec) {
   const m = Math.floor(sec / 60);
   const s = sec % 60;
   return m + ":" + (s < 10 ? "0" : "") + s;
+}
+
+function performSeek(pos) {
+  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  if (dur > 0) progressFill.style.width = (pos / dur * 100) + "%";
+  timeElapsed.textContent = formatTime(pos);
+  programmaticSeek = true;
+  videoPlayer.currentTime = pos;
+  api("/api/seek", "POST", { position: pos }).catch(e => showToast(e.message, true));
 }
 
 async function api(path, method, body) {
@@ -775,13 +817,7 @@ document.querySelectorAll(".ctrl-btn[data-skip]").forEach(zone => {
     const dur = parseFloat(timeDuration.dataset.raw || 0);
     const cur = videoPlayer.currentTime || 0;
     const pos = Math.max(0, Math.min(dur, cur + delta));
-    const pct = dur > 0 ? (pos / dur * 100) : 0;
-    progressFill.style.width = pct + "%";
-    timeElapsed.textContent = formatTime(pos);
-    programmaticSeek = true;
-    videoPlayer.currentTime = pos;
-    api("/api/seek", "POST", { position: pos })
-      .catch(e2 => showToast(e2.message, true));
+    performSeek(pos);
   });
 });
 
@@ -929,13 +965,7 @@ progressBar.addEventListener("click", (e) => {
   const pct = (e.clientX - rect.left) / rect.width;
   const dur = parseFloat(timeDuration.dataset.raw || 0);
   if (dur > 0) {
-    const pos = pct * dur;
-    progressFill.style.width = (pct * 100) + "%";
-    timeElapsed.textContent = formatTime(pos);
-    programmaticSeek = true;
-    videoPlayer.currentTime = pos;
-    api("/api/seek", "POST", { position: pos })
-      .catch(e2 => showToast(e2.message, true));
+    performSeek(pct * dur);
   }
 });
 
@@ -979,9 +1009,6 @@ function handleStatus(s) {
       if (s.state === "PLAYING") videoPlayer.play().catch(() => {});
     }
 
-    // Track Chromecast position for resync
-    lastCastTime = s.current_time || 0;
-
     // Mirror Chromecast: sync position and state
     if (currentStreamUrl && !isSeeking) {
       // Only correct position if drift > 1s to avoid constant seeking
@@ -1021,6 +1048,9 @@ window.addEventListener("load", () => {
   };
   evtSource.onerror = () => { statusBar.textContent = "Connection lost — reconnecting..."; };
 });
+window.addEventListener("beforeunload", () => {
+  if (evtSource) evtSource.close();
+});
 
 // Allow casting with Enter key
 urlInput.addEventListener("keydown", (e) => {
@@ -1042,12 +1072,7 @@ document.addEventListener("keydown", (e) => {
 
   function doSeek(delta) {
     const cur = videoPlayer.currentTime || 0;
-    const pos = Math.max(0, Math.min(dur, cur + delta));
-    progressFill.style.width = (dur > 0 ? pos / dur * 100 : 0) + "%";
-    timeElapsed.textContent = formatTime(pos);
-    programmaticSeek = true;
-    videoPlayer.currentTime = pos;
-    api("/api/seek", "POST", { position: pos }).catch(e2 => showToast(e2.message, true));
+    performSeek(Math.max(0, Math.min(dur, cur + delta)));
   }
 
   function doVolume(delta) {
@@ -1118,13 +1143,7 @@ document.addEventListener("keydown", (e) => {
     case "0": case "1": case "2": case "3": case "4":
     case "5": case "6": case "7": case "8": case "9":
       if (dur > 0) {
-        const pct = parseInt(e.key) / 10;
-        const pos = pct * dur;
-        progressFill.style.width = (pct * 100) + "%";
-        timeElapsed.textContent = formatTime(pos);
-        programmaticSeek = true;
-        videoPlayer.currentTime = pos;
-        api("/api/seek", "POST", { position: pos }).catch(e2 => showToast(e2.message, true));
+        performSeek(parseInt(e.key) / 10 * dur);
         showControls();
       }
       break;
