@@ -697,11 +697,16 @@ def seek():
     if position is None:
         return jsonify({"error": "No position provided"}), 400
     mc = cc.media_controller
+    try:
+        was_playing = mc.status and mc.status.player_state in ("PLAYING", "BUFFERING")
+    except Exception:
+        was_playing = False
     mc.seek(float(position))
-    # Some Chromecasts pause after seek — resume playback
+    # Some Chromecasts pause after seek — resume playback, but only if it was
+    # playing before the seek (a seek while paused must stay paused)
     time.sleep(0.3)
     try:
-        if mc.status and mc.status.player_state in ("PAUSED", "BUFFERING"):
+        if was_playing and mc.status and mc.status.player_state in ("PAUSED", "BUFFERING"):
             mc.play()
     except Exception:
         pass

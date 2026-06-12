@@ -875,6 +875,10 @@ videoPlayer.addEventListener("seeked", () => {
   lastSeekTime = Date.now();
   if (programmaticSeek) { programmaticSeek = false; return; }  // our controls — already sent to Chromecast
   if (!currentStreamUrl) return;
+  // Only forward seeks made via native fullscreen controls (iOS) — same rule as
+  // pause/play below. Browser-internal seeks (e.g. rewind-to-0 when play() is
+  // called on an ended element) must never reach the Chromecast.
+  if (!isFullscreen()) return;
   const pos = videoPlayer.currentTime;
   const dur = parseFloat(timeDuration.dataset.raw || 0);
   if (dur > 0) {
@@ -1042,7 +1046,20 @@ function handleStatus(s) {
     // Sync play/pause state — skip if video errored (CDN URL unreachable in browser),
     // otherwise we'd retry play() every 2s and never recover.
     if (localPlayerActive && currentStreamUrl && !videoPlayer.error) {
-      if (s.state === "PLAYING" && videoPlayer.paused && !videoPlayer.seeking) {
+      // Drift correction: snap the preview to the Chromecast position when they
+      // disagree by >3s. Skipped within 5s of any seek (lastSeekTime) so we don't
+      // fight the Chromecast while it's still executing one — this also rate-limits
+      // the snap itself, since it updates lastSeekTime via its own seeked event.
+      if (!isSeeking && !videoPlayer.seeking && videoPlayer.readyState >= 1 &&
+          s.duration > 0 && Date.now() - lastSeekTime > 5000 &&
+          Math.abs(videoPlayer.currentTime - s.current_time) > 3) {
+        programmaticSeek = true;
+        videoPlayer.currentTime = s.current_time;
+      }
+      // !ended guard: play() on an ended element rewinds it to 0, which used to
+      // echo a seek-to-0 to the Chromecast. If the preview ended early, the drift
+      // snap above un-ends it first.
+      if (s.state === "PLAYING" && videoPlayer.paused && !videoPlayer.seeking && !videoPlayer.ended) {
         videoPlayer.muted = true;
         videoPlayer.play().catch(() => {});
       } else if (s.state === "PAUSED" && !videoPlayer.paused) {
@@ -1227,6 +1244,7 @@ document.addEventListener("keydown", (e) => {
         const restoreTime = s.playback.current_time || 0;
         if (restoreTime > 0) {
           videoPlayer.addEventListener("loadedmetadata", () => {
+            programmaticSeek = true;
             videoPlayer.currentTime = restoreTime;
           }, { once: true });
         }
