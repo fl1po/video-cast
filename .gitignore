@@ -11,3 +11,5 @@ uploads/
 
 # sync-conflict copies
 * (# *#).*
+
+state.json
