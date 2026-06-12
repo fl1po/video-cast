@@ -1,8 +1,6 @@
 import threading
 import time
 import json
-import subprocess
-import sys
 import queue
 import re
 import os
@@ -11,12 +9,16 @@ import mimetypes
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, render_template, request, jsonify, Response, send_file
-pimport pychromecast
+import pychromecast
+import yt_dlp
 
-# Ensure deno is on PATH for yt-dlp JS challenge solving
-_deno_path = os.path.join(os.path.expanduser("~"), ".deno", "bin")
-if os.path.isdir(_deno_path) and _deno_path not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = _deno_path + os.pathsep + os.environ.get("PATH", "")
+# Ensure node is on PATH for yt-dlp JS challenge solving
+for _node_path in [
+    r"C:\Program Files\nodejs",
+    os.path.join(os.path.expanduser("~"), ".deno", "bin"),
+]:
+    if os.path.isdir(_node_path) and _node_path not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _node_path + os.pathsep + os.environ.get("PATH", "")
 
 app = Flask(__name__)
 
@@ -49,15 +51,14 @@ last_position = 0        # last known playback position
 intentional_stop = False  # True when user clicks Stop
 _casting_in_progress = False  # True while a new cast is being set up
 
-YT_DLP_FORMAT = "18/best[ext=mp4][protocol!=m3u8_native][protocol!=m3u8]/best[ext=mp4]/best"
-YT_DLP_BASE = [
-    sys.executable, "-m", "yt_dlp",
-    "--no-warnings",
-    "--remote-components", "ejs:github",
-    "--cookies-from-browser", "firefox",
-    "-f", YT_DLP_FORMAT,
-    "-j",
-]
+YT_DLP_FORMAT = "22/18/best[height<=720]/best"
+YT_DLP_OPTS = {
+    "format": YT_DLP_FORMAT,
+    "quiet": True,
+    "no_warnings": True,
+    "cookiesfrombrowser": ("firefox",),
+    "js_runtimes": {"node": {}},
+}
 
 
 def get_device_name(device_uuid):
@@ -223,18 +224,14 @@ _last_resume_attempt = 0
 
 def extract_stream_url(url):
     """Re-extract a fresh stream URL from the original video URL using yt-dlp."""
-    result = subprocess.run(
-        YT_DLP_BASE + [url],
-        capture_output=True, timeout=60,
-    )
-    if result.returncode != 0:
-        return None, None, None, None
     try:
-        info = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        with yt_dlp.YoutubeDL(dict(YT_DLP_OPTS)) as ydl:
+            info = ydl.extract_info(url, download=False)
+            info = ydl.sanitize_info(info)
         protocol = info.get("protocol", "")
         mime = "application/x-mpegURL" if "m3u8" in protocol else "video/mp4"
         return info.get("url", ""), info.get("title", "Unknown"), info.get("thumbnail", ""), mime
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except Exception:
         return None, None, None, None
 
 
@@ -400,7 +397,7 @@ def events():
                 except queue.Empty:
                     # Send keepalive comment to prevent timeout
                     yield ": keepalive\n\n"
-        except GeneratorExit:
+        except (GeneratorExit, OSError, BrokenPipeError, ConnectionResetError):
             pass
         finally:
             with sse_lock:
@@ -487,17 +484,11 @@ def cast():
         thumbnail_url = ""
         stream_mime = "application/x-mpegURL" if url_lower.endswith((".m3u", ".m3u8")) else "video/mp4"
     else:
-        # Extract stream URL with yt-dlp
+        # Extract stream URL with yt-dlp Python API
         try:
-            result = subprocess.run(
-                YT_DLP_BASE + [url],
-                capture_output=True, timeout=60,
-            )
-            if result.returncode != 0:
-                stderr = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
-                return jsonify({"error": f"yt-dlp failed: {stderr.strip()}"}), 500
-
-            info = json.loads(result.stdout.decode("utf-8", errors="replace"))
+            with yt_dlp.YoutubeDL(dict(YT_DLP_OPTS)) as ydl:
+                info = ydl.extract_info(url, download=False)
+                info = ydl.sanitize_info(info)
             video_title = info.get("title", "Unknown")
             stream_url = info.get("url", "")
             thumbnail_url = info.get("thumbnail", "")
@@ -507,10 +498,10 @@ def cast():
             if not stream_url:
                 return jsonify({"error": "yt-dlp returned no stream URL"}), 500
 
-        except subprocess.TimeoutExpired:
-            return jsonify({"error": "yt-dlp timed out"}), 504
-        except FileNotFoundError:
-            return jsonify({"error": "yt-dlp not found. Install with: pip install yt-dlp"}), 500
+        except yt_dlp.utils.DownloadError as e:
+            return jsonify({"error": f"yt-dlp: {e}"}), 500
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     try:
         _casting_in_progress = True

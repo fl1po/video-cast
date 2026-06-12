@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# pip --prefix leftovers — deps belong in the user/global site-packages
+Lib/
+Scripts/
+share/
+
+uploads/
+.claude/
+
+# sync-conflict copies
+* (# *#).*

@@ -9,9 +9,11 @@ Uses [yt-dlp](https://github.com/yt-dlp/yt-dlp) to extract direct stream URLs (b
 ## Setup
 
 ```
-pip install flask pychromecast yt-dlp
+pip install -r requirements.txt
 python app.py
 ```
+
+> **Note:** `yt-dlp[default]` (not plain `yt-dlp`) is required — it includes `yt-dlp-ejs`, which solves YouTube's JS challenge. Without it most formats are unavailable and casting YouTube URLs fails with "Requested format is not available". A JS runtime (Node.js or Deno) must also be installed.
 
 Open `http://localhost:5000` in your browser.
 
@@ -60,5 +62,6 @@ Double-click `start.vbs` to run the server in the background, or place it in `sh
 ## Requirements
 
 - Python 3.7+
+- Node.js (or Deno) — used by yt-dlp to solve YouTube's JS challenge
 - Chromecast on the same local network
-- `flask`, `pychromecast`, `yt-dlp`
+- `flask`, `pychromecast`, `yt-dlp[default]` (see `requirements.txt`)

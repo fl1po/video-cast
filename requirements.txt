@@ -1,0 +1,6 @@
+flask
+pychromecast
+# [default] pulls in yt-dlp-ejs, brotli, pycryptodomex, mutagen, websockets —
+# yt-dlp-ejs is required to solve YouTube's JS challenge, without it most
+# formats are unavailable ("Requested format is not available").
+yt-dlp[default]

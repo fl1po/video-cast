@@ -560,11 +560,14 @@ const toast = $("toast");
 
 let currentState = "IDLE";
 let isSeeking = false;
-let lastSeekTime = 0;          // timestamp of last seek — suppress pause events shortly after
-let programmaticSeek = false;  // true when our controls set currentTime (already sent to cast)
-let sseSyncCount = 0;          // incremented when SSE mirror sets currentTime
+let lastSeekTime = 0;
+let programmaticSeek = false;
 let volumeChanging = false;
 let currentStreamUrl = "";
+let localPlayerActive = false; // true only when user clicked Cast this session — avoids competing for CDN session
+let sseCurrentTime = 0; // last known position from SSE, used as fallback when local video isn't loaded
+let castingInProgress = false; // true while cast API call is in flight — prevents IDLE SSE from clearing state
+let castCompletedAt = 0; // timestamp when cast last finished — prevents SSE from pausing video during Chromecast startup
 
 function showToast(msg, isError) {
   toast.textContent = msg;
@@ -584,8 +587,8 @@ function performSeek(pos) {
   const dur = parseFloat(timeDuration.dataset.raw || 0);
   if (dur > 0) progressFill.style.width = (pos / dur * 100) + "%";
   timeElapsed.textContent = formatTime(pos);
-  programmaticSeek = true;
-  videoPlayer.currentTime = pos;
+  sseCurrentTime = pos;
+  if (!videoPlayer.error) { programmaticSeek = true; videoPlayer.currentTime = pos; }
   api("/api/seek", "POST", { position: pos }).catch(e => showToast(e.message, true));
 }
 
@@ -641,6 +644,7 @@ fileInput.addEventListener("change", async () => {
 
   castBtn.disabled = true;
   castBtn.textContent = "Uploading...";
+  castingInProgress = true;
   videoSection.style.display = "block";
   showOverlay("Uploading...");
 
@@ -655,17 +659,23 @@ fileInput.addEventListener("change", async () => {
     urlInput.value = file.name;
     showToast("Casting: " + data.title);
     if (data.stream_url) {
+      localPlayerActive = true;
+      castCompletedAt = Date.now();
       currentStreamUrl = data.stream_url;
       videoPlayer.src = data.stream_url;
+      videoPlayer.muted = true;
+      videoPlayer.addEventListener("canplay", () => { videoPlayer.muted = true; videoPlayer.play().catch(() => {}); }, { once: true });
       videoTitle.textContent = data.title || "Now Playing";
       document.title = data.title || "YT Chromecast";
       videoSection.style.display = "block";
+      showControls();
     }
   } catch (e) {
     showToast("Cast failed: " + e.message, true);
     hideOverlay();
     if (!currentStreamUrl) videoSection.style.display = "none";
   } finally {
+    castingInProgress = false;
     castBtn.disabled = false;
     castBtn.textContent = "Cast";
     fileInput.value = "";
@@ -681,17 +691,24 @@ castBtn.addEventListener("click", async () => {
 
   castBtn.disabled = true;
   castBtn.textContent = "Casting...";
+  castingInProgress = true;
   videoSection.style.display = "block";
   showOverlay("Loading...");
   try {
     const data = await api("/api/cast", "POST", { url, device_uuid });
     showToast("Casting: " + data.title);
     if (data.stream_url) {
+      localPlayerActive = true;
+      castCompletedAt = Date.now();
       currentStreamUrl = data.stream_url;
+      videoPlayer.poster = data.thumbnail || "";
       videoPlayer.src = data.stream_url;
+      videoPlayer.muted = true;
+      videoPlayer.addEventListener("canplay", () => { videoPlayer.muted = true; videoPlayer.play().catch(() => {}); }, { once: true });
       videoTitle.textContent = data.title || "Now Playing";
       document.title = data.title || "YT Chromecast";
       videoSection.style.display = "block";
+      showControls();
       if (data.start_time > 0) {
         programmaticSeek = true;
         videoPlayer.currentTime = data.start_time;
@@ -702,6 +719,7 @@ castBtn.addEventListener("click", async () => {
     hideOverlay();
     if (!currentStreamUrl) videoSection.style.display = "none";
   } finally {
+    castingInProgress = false;
     castBtn.disabled = false;
     castBtn.textContent = "Cast";
   }
@@ -824,6 +842,7 @@ document.querySelectorAll(".ctrl-btn[data-skip]").forEach(zone => {
 // Stop
 stopBtn.addEventListener("click", (e) => {
   e.stopPropagation();
+  localPlayerActive = false;
   optimisticState("IDLE");
   videoPlayer.pause();
   videoPlayer.removeAttribute("src");
@@ -846,13 +865,15 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
+// Clear overlay if local video fails to load (CDN URL may reject browser requests)
+videoPlayer.addEventListener("error", () => { hideOverlay(); });
+
 // Track browser seeking state
 videoPlayer.addEventListener("seeking", () => { isSeeking = true; });
 videoPlayer.addEventListener("seeked", () => {
   isSeeking = false;
   lastSeekTime = Date.now();
-  if (sseSyncCount > 0) { sseSyncCount--; return; }  // SSE mirror sync — don't echo back
-  if (programmaticSeek) { programmaticSeek = false; return; }  // our controls — already sent
+  if (programmaticSeek) { programmaticSeek = false; return; }  // our controls — already sent to Chromecast
   if (!currentStreamUrl) return;
   const pos = videoPlayer.currentTime;
   const dur = parseFloat(timeDuration.dataset.raw || 0);
@@ -881,11 +902,11 @@ videoPlayer.addEventListener("pause", () => {
 });
 
 videoPlayer.addEventListener("play", () => {
-  if (!isFullscreen()) return;
   if (!currentStreamUrl || isSeeking || programmaticSeek) return;
   if (currentState === "PLAYING") return;
   optimisticState("PLAYING");
   updatePlayPauseIcon();
+  if (!isFullscreen()) return;  // only forward to Chromecast when in fullscreen (iOS native controls)
   api("/api/play", "POST").catch(e => showToast(e.message, true));
 });
 
@@ -971,6 +992,7 @@ progressBar.addEventListener("click", (e) => {
 
 // SSE status stream
 function handleStatus(s) {
+  const prevState = currentState;
   currentState = s.state;
 
   if (s.connected && s.state !== "IDLE" && s.state !== "UNKNOWN") {
@@ -981,6 +1003,9 @@ function handleStatus(s) {
     if (s.state === "BUFFERING") showOverlay("Buffering...");
     else if (s.state === "PLAYING" || s.state === "PAUSED") hideOverlay();
 
+    // Show controls when transitioning into PLAYING (e.g. SSE fires before play event)
+    if (s.state === "PLAYING" && prevState !== "PLAYING") showControls();
+
     // Progress
     if (!isSeeking) {
       const pct = s.duration > 0 ? (s.current_time / s.duration * 100) : 0;
@@ -988,6 +1013,7 @@ function handleStatus(s) {
       timeElapsed.textContent = formatTime(s.current_time);
       timeDuration.textContent = formatTime(s.duration);
       timeDuration.dataset.raw = s.duration;
+      sseCurrentTime = s.current_time || 0;
     }
 
     // Volume
@@ -997,37 +1023,40 @@ function handleStatus(s) {
       volumePct.textContent = vol + "%";
     }
 
-    // Video player — load if new stream
-    if (s.stream_url && s.stream_url !== currentStreamUrl) {
-      currentStreamUrl = s.stream_url;
-      videoPlayer.src = s.stream_url;
+    // Title/section visible whenever something is playing
+    if (s.stream_url) {
       videoTitle.textContent = s.title || "Now Playing";
       document.title = s.title || "YT Chromecast";
       videoSection.style.display = "block";
-      sseSyncCount++;
-      videoPlayer.currentTime = s.current_time || 0;
-      if (s.state === "PLAYING") videoPlayer.play().catch(() => {});
     }
 
-    // Mirror Chromecast: sync position and state
-    if (currentStreamUrl && !isSeeking) {
-      // Only correct position if drift > 1s to avoid constant seeking
-      const drift = Math.abs(s.current_time - videoPlayer.currentTime);
-      if (drift > 1) {
-        sseSyncCount++;
-        videoPlayer.currentTime = s.current_time;
-      }
-      if (s.state === "PLAYING" && videoPlayer.paused) {
+    // Load local video only when user cast this session (avoids competing for CDN session on refresh)
+    if (localPlayerActive && s.stream_url && s.stream_url !== currentStreamUrl) {
+      currentStreamUrl = s.stream_url;
+      videoPlayer.poster = s.thumbnail || "";
+      videoPlayer.src = s.stream_url;
+      videoPlayer.muted = true;
+      if (s.state === "PLAYING") { videoPlayer.muted = true; videoPlayer.play().catch(() => {}); }
+    }
+
+    // Sync play/pause state — skip if video errored (CDN URL unreachable in browser),
+    // otherwise we'd retry play() every 2s and never recover.
+    if (localPlayerActive && currentStreamUrl && !videoPlayer.error) {
+      if (s.state === "PLAYING" && videoPlayer.paused && !videoPlayer.seeking) {
+        videoPlayer.muted = true;
         videoPlayer.play().catch(() => {});
       } else if (s.state === "PAUSED" && !videoPlayer.paused) {
-        videoPlayer.pause();
+        // Skip SSE-driven pause for 5s after cast completes — Chromecast takes time to
+        // reach PLAYING state and we don't want to mirror its transient PAUSED/BUFFERING.
+        if (Date.now() - castCompletedAt > 5000) videoPlayer.pause();
       }
     }
   } else {
     statusBar.textContent = s.connected ? "Idle" : "Not connected";
     if (s.state === "IDLE" || !s.connected) {
     
-      if (currentStreamUrl) {
+      if (currentStreamUrl && !castingInProgress) {
+        localPlayerActive = false;
         videoPlayer.pause();
         videoPlayer.removeAttribute("src");
         videoPlayer.load();
@@ -1071,7 +1100,7 @@ document.addEventListener("keydown", (e) => {
   let handled = true;
 
   function doSeek(delta) {
-    const cur = videoPlayer.currentTime || 0;
+    const cur = (videoPlayer.currentTime > 0 ? videoPlayer.currentTime : sseCurrentTime) || 0;
     performSeek(Math.max(0, Math.min(dur, cur + delta)));
   }
 
@@ -1184,8 +1213,28 @@ document.addEventListener("keydown", (e) => {
       });
     }
 
-    // Restore active playback
+    // Restore active playback — wire up video element directly, then call handleStatus for UI sync.
     if (s.playback && s.playback.connected && s.playback.state !== "IDLE" && s.playback.state !== "UNKNOWN") {
+      if (s.playback.stream_url) {
+        localPlayerActive = true;
+        castCompletedAt = Date.now();
+        currentStreamUrl = s.playback.stream_url;
+        sseCurrentTime = s.playback.current_time || 0;
+        videoPlayer.poster = s.playback.thumbnail || "";
+        videoPlayer.muted = true;
+        videoPlayer.src = s.playback.stream_url;
+        // Seek to current position once metadata is ready, then let SSE play-sync trigger play().
+        const restoreTime = s.playback.current_time || 0;
+        if (restoreTime > 0) {
+          videoPlayer.addEventListener("loadedmetadata", () => {
+            videoPlayer.currentTime = restoreTime;
+          }, { once: true });
+        }
+        videoTitle.textContent = s.playback.title || "Now Playing";
+        document.title = s.playback.title || "YT Chromecast";
+        videoSection.style.display = "block";
+        showControls();
+      }
       handleStatus(s.playback);
     }
   } catch {}
