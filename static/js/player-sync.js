@@ -16,6 +16,11 @@
   // seconds before it starts playing and executes the deferred start-time seek.
   var CAST_SEEK_GRACE_MS = 15000;
   var CAST_STATE_GRACE_MS = 5000;
+  // The receiver keeps reporting IDLE for a while after play_media (it is
+  // still loading the new media, and /api/cast returns before playback
+  // starts). Only after this long with no active state is a post-cast IDLE
+  // a real stop.
+  var CAST_IDLE_GRACE_MS = 15000;
 
   function createPlayerSync() {
     // The user's most recent play/pause intent, held until the server confirms
@@ -27,6 +32,7 @@
     var pendingSeek = null; // {target: seconds, at: ms, graceMs: ms}
     var lastSnapAt = -Infinity; // rate-limits drift snaps
     var lastCastAt = -Infinity; // suppresses transient state mirroring after a cast
+    var castSeenActive = false; // the cast has reported an active state since noteCast
     var lastServer = null; // {time: seconds, playing: bool, at: ms} — last applied status
 
     function seekConfirmed(server, now) {
@@ -50,10 +56,21 @@
       },
       noteCast(startTime, now) {
         lastCastAt = now;
+        castSeenActive = false;
         pendingState = null;
         pendingSeek = startTime > 0
           ? { target: startTime, at: now, graceMs: CAST_SEEK_GRACE_MS }
           : null;
+      },
+
+      // Whether an IDLE / disconnected status should tear the preview down.
+      // Tearing down on the receiver's transient post-cast IDLE was the
+      // "preview black until refresh" bug: the teardown cleared the local
+      // player permanently, and nothing reloads it without a page refresh.
+      // IDLE is a real stop once the cast has been seen active, or once the
+      // grace expires (the cast genuinely failed or was stopped).
+      shouldClearOnIdle(now) {
+        return castSeenActive || now - lastCastAt > CAST_IDLE_GRACE_MS;
       },
 
       // Best estimate of the true cast position right now: a pending seek
@@ -69,7 +86,9 @@
       // server: {state, current_time, duration}
       // local:  {currentTime, paused, ended, seeking, readyState, error}
       // now:    ms timestamp (injected for testability)
+      // Only called with active (connected, non-IDLE) statuses.
       reconcile(server, local, now) {
+        castSeenActive = true;
         if (pendingState) {
           if (server.state === pendingState.state || now - pendingState.at > ACTION_GRACE_MS) {
             pendingState = null; // confirmed, or device ignored us — server wins

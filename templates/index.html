@@ -685,9 +685,9 @@ fileInput.addEventListener("change", async () => {
 
     urlInput.value = file.name;
     showToast("Casting: " + data.title);
+    sync.noteCast(0, Date.now());
     if (data.stream_url) {
       localPlayerActive = true;
-      sync.noteCast(0, Date.now());
       currentStreamUrl = data.stream_url;
       videoPlayer.src = data.stream_url;
       videoPlayer.muted = true;
@@ -724,9 +724,11 @@ castBtn.addEventListener("click", async () => {
   try {
     const data = await api("/api/cast", "POST", { url, device_uuid });
     showToast("Casting: " + data.title);
+    // Note the cast even without a preview URL (m3u8): the post-cast IDLE
+    // grace must apply to every fresh cast.
+    sync.noteCast(data.start_time || 0, Date.now());
     if (data.stream_url) {
       localPlayerActive = true;
-      sync.noteCast(data.start_time || 0, Date.now());
       currentStreamUrl = data.stream_url;
       videoPlayer.poster = data.thumbnail || "";
       videoPlayer.src = data.stream_url;
@@ -1197,8 +1199,11 @@ function handleStatus(s) {
     statusBar.textContent = s.connected ? "Idle" : "Not connected";
     // Cast stopped or ended (possibly from another device) — clear the preview
     // on every open window, including ones that never loaded a stream (cast
-    // started elsewhere, m3u8 casts with no preview URL).
-    if ((s.state === "IDLE" || !s.connected) && !castingInProgress) {
+    // started elsewhere, m3u8 casts with no preview URL). The engine ignores
+    // the receiver's transient IDLE while a fresh cast is still loading —
+    // tearing down on that echo left the preview black until refresh.
+    if ((s.state === "IDLE" || !s.connected) && !castingInProgress &&
+        sync.shouldClearOnIdle(Date.now())) {
       localPlayerActive = false;
       playGate.classList.remove("visible");
       if (currentStreamUrl) {

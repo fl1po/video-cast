@@ -55,6 +55,12 @@ cached_devices = []
 last_position = 0        # last known playback position
 intentional_stop = False  # True when user clicks Stop
 _casting_in_progress = False  # True while a new cast is being set up
+last_cast_at = 0.0       # when play_media was last sent
+
+# The receiver keeps reporting IDLE for a while after play_media (the cast
+# endpoint returns before playback starts) — within this window an IDLE
+# status means "still loading", not "stopped" (mirrors the client grace).
+CAST_IDLE_GRACE_S = 15
 
 YT_DLP_FORMAT = "22/18/best[height<=720]/best"
 YT_DLP_OPTS = {
@@ -242,7 +248,7 @@ def extract_stream_url(url):
 
 def auto_resume():
     """Re-cast the last stream and seek to saved position after TV wakes."""
-    global cast_device, intentional_stop, _last_resume_attempt, media_stream_url, media_title, media_thumbnail, _casting_in_progress
+    global cast_device, intentional_stop, _last_resume_attempt, media_stream_url, media_title, media_thumbnail, _casting_in_progress, last_cast_at
     if not _resume_lock.acquire(blocking=False):
         return  # another resume already in progress
     _casting_in_progress = True
@@ -278,6 +284,7 @@ def auto_resume():
 
         # Re-cast
         mc = cc.media_controller
+        last_cast_at = time.time()
         mc.play_media(
             stream_url,
             mime or "video/mp4",
@@ -315,8 +322,11 @@ class MediaStatusListener:
                 last_position = pos
                 intentional_stop = False
         # Auto-resume if cast went idle unexpectedly (TV sleep/wake)
-        # But NOT if video ended naturally (position near duration)
-        elif status.player_state == "IDLE" and not intentional_stop and not _casting_in_progress and last_url:
+        # But NOT if video ended naturally (position near duration) and not
+        # while a fresh cast's receiver is still loading (transient IDLE)
+        elif (status.player_state == "IDLE" and not intentional_stop
+              and not _casting_in_progress and last_url
+              and time.time() - last_cast_at > CAST_IDLE_GRACE_S):
             duration = status.duration or 0
             if duration > 0 and last_position > 0 and (duration - last_position) < 5:
                 intentional_stop = True  # video finished naturally
@@ -463,7 +473,7 @@ def parse_timestamp(url):
 @app.route("/api/cast", methods=["POST"])
 def cast():
     """Extract stream URL via yt-dlp and cast to selected Chromecast."""
-    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, intentional_stop, last_position, _casting_in_progress
+    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, intentional_stop, last_position, _casting_in_progress, last_cast_at
 
     data = request.json
     url = data.get("url", "").strip()
@@ -522,6 +532,7 @@ def cast():
         media_stream_url = stream_url
 
         mc = cc.media_controller
+        last_cast_at = time.time()
         mc.play_media(stream_url, stream_mime, title=video_title, thumb=thumbnail_url)
         mc.block_until_active(timeout=30)
         _casting_in_progress = False
@@ -567,7 +578,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 @app.route("/api/cast_file", methods=["POST"])
 def cast_file():
     """Upload a local file and cast it to Chromecast."""
-    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, local_file_path, intentional_stop, last_position, _casting_in_progress
+    global cast_device, media_title, media_thumbnail, media_stream_url, last_url, last_device_uuid, local_file_path, intentional_stop, last_position, _casting_in_progress, last_cast_at
 
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
@@ -623,6 +634,7 @@ def cast_file():
         media_stream_url = stream_url
 
         mc = cc.media_controller
+        last_cast_at = time.time()
         mc.play_media(stream_url, mime, title=video_title)
         mc.block_until_active(timeout=30)
         _casting_in_progress = False

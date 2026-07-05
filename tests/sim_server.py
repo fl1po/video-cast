@@ -27,6 +27,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app as videocast  # noqa: E402
 
 CONFIRM_DELAY = float(os.environ.get("SIM_CONFIRM_DELAY", "0.4"))
+# How long the fake receiver stays IDLE after play_media before it starts
+# playing. Real Chromecasts report IDLE for seconds after /api/cast returns
+# (block_until_active only waits for the media channel) and push status
+# events during that window — the black-preview-until-refresh bug only
+# reproduces with this behavior. Set to 0 for an instant receiver.
+LOAD_DELAY = float(os.environ.get("SIM_LOAD_DELAY", "2.0"))
 FAKE_UUID = "00000000-0000-0000-0000-00000000fake"
 
 
@@ -74,14 +80,22 @@ class SimMediaController:
 
     def play_media(self, url, mime, title="", thumb=""):
         self.status.title = title
-        self.status.player_state = "BUFFERING"
         self.status.set_position(0)
 
         def start():
             self.status.player_state = "PLAYING"
             self.status.set_position(0)
             self._notify()
-        threading.Timer(CONFIRM_DELAY * 3, start).start()
+
+        if LOAD_DELAY > 0:
+            # Like a real receiver: still IDLE when the cast endpoint returns,
+            # and it pushes (still-IDLE) status events while loading.
+            self.status.player_state = "IDLE"
+            threading.Timer(LOAD_DELAY / 2, self._notify).start()
+            threading.Timer(LOAD_DELAY, start).start()
+        else:
+            self.status.player_state = "BUFFERING"
+            threading.Timer(CONFIRM_DELAY * 3, start).start()
 
     def block_until_active(self, timeout=None):
         time.sleep(0.1)

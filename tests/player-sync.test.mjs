@@ -180,6 +180,40 @@ test("never plays an ended or errored preview (play() would rewind / spin foreve
   assert.equal(sync.reconcile(playingServer(100), { ...pausedLocal, seeking: true }, 30_000).play, false);
 });
 
+test("transient IDLE right after casting must not tear down the preview (black-until-refresh bug)", () => {
+  const sync = createPlayerSync();
+  sync.noteCast(0, 10_000);
+  // Receiver is still loading: /api/cast already returned, but the device
+  // keeps reporting IDLE for a few seconds.
+  assert.equal(sync.shouldClearOnIdle(11_500), false);
+});
+
+test("IDLE after the cast has been seen active is a real stop", () => {
+  const sync = createPlayerSync();
+  sync.noteCast(0, 10_000);
+  sync.reconcile(playingServer(1), playingLocal(1), 13_000); // receiver started
+  assert.equal(sync.shouldClearOnIdle(13_500), true);
+});
+
+test("IDLE with no recent cast is a real stop (cast stopped from another device)", () => {
+  const sync = createPlayerSync();
+  assert.equal(sync.shouldClearOnIdle(10_000), true);
+});
+
+test("cast that never starts: IDLE tears down once the grace expires", () => {
+  const sync = createPlayerSync();
+  sync.noteCast(0, 10_000);
+  assert.equal(sync.shouldClearOnIdle(26_000), true);
+});
+
+test("a new cast re-arms the IDLE grace even after a previous cast was active", () => {
+  const sync = createPlayerSync();
+  sync.noteCast(0, 10_000);
+  sync.reconcile(playingServer(5), playingLocal(5), 12_000);
+  sync.noteCast(0, 50_000); // user casts the next video
+  assert.equal(sync.shouldClearOnIdle(51_000), false, "new receiver load window");
+});
+
 test("steady-state playback: server progress is applied, no corrective actions", () => {
   const sync = createPlayerSync();
   const r = sync.reconcile(playingServer(100), playingLocal(100), 10_000);
