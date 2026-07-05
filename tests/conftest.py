@@ -1,8 +1,9 @@
 """Test scaffolding for the video-cast backend.
 
-The Chromecast is the external boundary — it's faked. Everything else
-(Flask routes, SSE broadcaster thread, listener wiring) is real: tests talk
-HTTP to a live server and read the actual /api/events stream.
+The Cast Platform is the seam — the device is faked at the Device contract
+(see castplatform.py's docstring). Everything else (Flask routes, the Status
+Broadcaster thread, session wiring) is real: tests talk HTTP to a live
+server and read the actual /api/events stream.
 """
 import json
 import os
@@ -14,13 +15,17 @@ import http.client
 
 import pytest
 
-# Isolate state + disable periodic SSE ticks BEFORE the app module loads
-# (it reads state and starts its broadcaster thread at import time).
-os.environ["VIDEOCAST_STATE_FILE"] = os.path.join(tempfile.mkdtemp(), "state.json")
-os.environ["VIDEOCAST_SSE_POLL_PLAYING"] = "60"
-os.environ["VIDEOCAST_SSE_POLL_IDLE"] = "60"
+import app as videocast
 
-import app as videocast  # noqa: E402
+
+class NullPlatform:
+    """No devices on the network; tests attach fakes directly."""
+
+    def discover(self, wait_s=0):
+        return []
+
+    def connect(self, friendly_name, timeout=30):
+        raise RuntimeError("no real devices in tests")
 
 
 class FakeMediaStatus:
@@ -32,18 +37,30 @@ class FakeMediaStatus:
         self.title = "Test Video"
 
 
-class FakeMediaController:
-    """Stands in for pychromecast's MediaController: records commands and
-    only changes its cached status when the test *confirms* them — exactly
-    how a real Chromecast behaves."""
+class FakeDevice:
+    """Stands in for a connected Device at the platform seam: records
+    commands and only fires status events when the test *confirms* them —
+    exactly how a real Chromecast behaves."""
 
     def __init__(self):
-        self.status = FakeMediaStatus()
-        self.listeners = []
+        self.media_status = FakeMediaStatus()
+        self.volume_level = 0.5
+        self.volume_muted = False
         self.commands = []
+        self._media_cbs = []
+        self._cast_cbs = []
 
-    def register_status_listener(self, listener):
-        self.listeners.append(listener)
+    def on_media_status(self, cb):
+        self._media_cbs.append(cb)
+
+    def on_cast_status(self, cb):
+        self._cast_cbs.append(cb)
+
+    def play_media(self, url, mime, title="", thumb=""):
+        self.commands.append(("play_media", url, mime))
+
+    def block_until_active(self, timeout=None):
+        pass
 
     def play(self):
         self.commands.append("play")
@@ -62,39 +79,25 @@ class FakeMediaController:
         # deliver that reply explicitly via confirm().
         self.commands.append("update_status")
 
-    def confirm(self, **changes):
-        """Simulate the device reporting a status change back."""
-        for key, value in changes.items():
-            setattr(self.status, key, value)
-        if "current_time" in changes:
-            self.status.adjusted_current_time = changes["current_time"]
-        for listener in self.listeners:
-            listener.new_media_status(self.status)
-
-
-class FakeCastStatus:
-    def __init__(self):
-        self.volume_level = 0.5
-        self.volume_muted = False
-
-
-class FakeCastDevice:
-    def __init__(self):
-        self.media_controller = FakeMediaController()
-        self.status = FakeCastStatus()
-        self.cast_listeners = []
-        self.commands = []
-
-    def register_status_listener(self, listener):
-        self.cast_listeners.append(listener)
-
     def set_volume(self, level):
         self.commands.append(("set_volume", level))
 
+    def disconnect(self):
+        self.commands.append("disconnect")
+
+    def confirm(self, **changes):
+        """Simulate the device reporting a media status change back."""
+        for key, value in changes.items():
+            setattr(self.media_status, key, value)
+        if "current_time" in changes:
+            self.media_status.adjusted_current_time = changes["current_time"]
+        for cb in self._media_cbs:
+            cb(self.media_status)
+
     def confirm_volume(self, level):
-        self.status.volume_level = level
-        for listener in self.cast_listeners:
-            listener.new_cast_status(self.status)
+        self.volume_level = level
+        for cb in self._cast_cbs:
+            cb(self)
 
 
 class SSEClient:
@@ -135,22 +138,35 @@ class SSEClient:
 
 
 @pytest.fixture(scope="session")
-def server_port():
+def flask_app():
+    # Scratch state file + long poll intervals: broadcasts in tests come
+    # from wake(), never from the periodic timer.
+    state_file = os.path.join(tempfile.mkdtemp(), "state.json")
+    return videocast.create_app(state_file=state_file, platform=NullPlatform(),
+                                poll_playing=60, poll_idle=60)
+
+
+@pytest.fixture(scope="session")
+def server_port(flask_app):
     from werkzeug.serving import make_server
-    server = make_server("127.0.0.1", 0, videocast.app, threaded=True)
+    server = make_server("127.0.0.1", 0, flask_app, threaded=True)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield server.server_port
     server.shutdown()
 
 
 @pytest.fixture
-def device():
-    fake = FakeCastDevice()
-    videocast.cast_device = fake
-    videocast.register_listeners(fake)
-    videocast.intentional_stop = False
+def cast_session(flask_app):
+    return flask_app.videocast.session
+
+
+@pytest.fixture
+def device(cast_session):
+    fake = FakeDevice()
+    cast_session.attach_device(fake)
+    cast_session.intentional_stop = False
     yield fake
-    videocast.cast_device = None
+    cast_session.attach_device(None)
 
 
 @pytest.fixture
