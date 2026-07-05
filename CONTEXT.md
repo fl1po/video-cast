@@ -32,8 +32,12 @@ _Avoid_: stream info, video info
 The muted local `<video>` element mirroring the Device. Driven by the sync engine's actions; never the source of truth.
 _Avoid_: local player, mirror
 
+**Preview Controller**:
+`preview-controller.js` — the pure, node-tested state machine owning every Preview decision: lifecycle (load/swap/teardown), autoplay-blocked fallback, native-event forwarding, user intents, display state. The page's single interface: events in, an actions object out (DOM writes and backend commands both); the page only reads snapshots and applies actions.
+_Avoid_: page logic, wiring
+
 **Sync Engine**:
-`player-sync.js` — the pure, node-tested module that reconciles Device status against the Preview and pending user intents, returning actions the page applies.
+`player-sync.js` — reconciles Device status against the Preview and pending user intents. An internal seam of the Preview Controller (separately tested); the page never calls it directly.
 _Avoid_: player logic, reconciler
 
 **Post-Cast Idle Grace**:

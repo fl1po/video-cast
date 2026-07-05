@@ -557,6 +557,7 @@
 <div class="toast" id="toast"></div>
 
 <script src="{{ url_for('static', filename='js/player-sync.js') }}"></script>
+<script src="{{ url_for('static', filename='js/preview-controller.js') }}"></script>
 <script>
 const $ = id => document.getElementById(id);
 
@@ -582,19 +583,41 @@ const volumeSlider = $("volumeSlider");
 const volumePct = $("volumePct");
 const statusBar = $("statusBar");
 const toast = $("toast");
+const playGate = $("playGate");
+const fileInput = $("fileInput");
+const fileBtn = $("fileBtn");
+const muteBtn = $("muteBtn");
+const fsBtn = $("fsBtn");
+const seekTooltip = $("seekTooltip");
 
-// Reconciles Chromecast status (SSE) with the local preview — tracks pending
-// user actions so stale server echoes can't bounce the UI (see player-sync.js).
-const sync = createPlayerSync();
+// The Preview Controller owns every preview decision — lifecycle (load /
+// swap / teardown), the autoplay-blocked fallback, native-event forwarding,
+// user intents, display state (see preview-controller.js; tested with
+// node --test). The page below is a dumb adapter: it reads <video>
+// snapshots, feeds events in, and applies the returned actions. No playback
+// decisions live in this file.
+const ctrl = createPreviewController(createPlayerSync());
 
-let currentState = "IDLE";
-let isSeeking = false;
-let lastSeekTime = 0;
-let programmaticSeek = false;
-let volumeChanging = false;
-let currentStreamUrl = "";
-let localPlayerActive = false; // true only when user clicked Cast this session — avoids competing for CDN session
-let castingInProgress = false; // true while cast API call is in flight — prevents IDLE SSE from clearing state
+let volumeChanging = false; // slider drag in progress — ignore SSE volume
+
+function snap() {
+  return {
+    currentTime: videoPlayer.currentTime || 0,
+    paused: videoPlayer.paused,
+    ended: videoPlayer.ended,
+    seeking: videoPlayer.seeking,
+    readyState: videoPlayer.readyState,
+    error: videoPlayer.error,
+  };
+}
+
+function isFullscreen() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement || videoPlayer.webkitDisplayingFullscreen);
+}
+
+function ctx() {
+  return { fullscreen: isFullscreen() };
+}
 
 function showToast(msg, isError) {
   toast.textContent = msg;
@@ -610,15 +633,6 @@ function formatTime(sec) {
   return m + ":" + (s < 10 ? "0" : "") + s;
 }
 
-function performSeek(pos) {
-  sync.noteSeek(pos, Date.now());
-  const dur = parseFloat(timeDuration.dataset.raw || 0);
-  if (dur > 0) progressFill.style.width = (pos / dur * 100) + "%";
-  timeElapsed.textContent = formatTime(pos);
-  if (!videoPlayer.error) { programmaticSeek = true; videoPlayer.currentTime = pos; }
-  api("/api/seek", "POST", { position: pos }).catch(e => showToast(e.message, true));
-}
-
 async function api(path, method, body) {
   const opts = { method };
   if (body) {
@@ -629,6 +643,114 @@ async function api(path, method, body) {
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || "Request failed");
   return data;
+}
+
+// play() mechanics: browsers (notably Firefox with autoplay set to "Block
+// Audio and Video") reject play() without a user gesture. The outcomes are
+// reported to the controller, which owns the fallback (frame-stepping via
+// tick(), the "Smooth preview" chip, gesture unlock).
+function tryPlay() {
+  videoPlayer.muted = true;
+  const p = videoPlayer.play();
+  if (p) p.then(() => apply(ctrl.playStarted(snap(), Date.now())))
+         .catch(err => {
+           if (err && err.name === "NotAllowedError") apply(ctrl.playRefused(Date.now()));
+         });
+}
+
+// apply(actions) — the single place the controller's decisions become DOM
+// writes and backend commands. Order matters: load before seek before play.
+function apply(a) {
+  if (!a) return;
+  if (a.title !== undefined) {
+    videoTitle.textContent = a.title || "Now Playing";
+    document.title = a.title || "YT Chromecast";
+  }
+  if (a.showSection) videoSection.style.display = "block";
+  if (a.setSrc) {
+    videoPlayer.poster = a.poster || "";
+    videoPlayer.src = a.setSrc;
+    videoPlayer.muted = true;
+    if (a.playWhenReady) videoPlayer.addEventListener("canplay", tryPlay, { once: true });
+  }
+  if (a.seekWhenReady !== undefined) {
+    videoPlayer.addEventListener("loadedmetadata", () => {
+      ctrl.noteProgrammaticSeek();
+      videoPlayer.currentTime = a.seekWhenReady;
+    }, { once: true });
+  }
+  if (a.seekTo !== undefined && a.seekTo !== null) {
+    ctrl.noteProgrammaticSeek();
+    videoPlayer.currentTime = a.seekTo;
+  }
+  if (a.play) tryPlay();
+  else if (a.pause) videoPlayer.pause();
+  if (a.clearSrc) {
+    videoPlayer.pause();
+    videoPlayer.removeAttribute("src");
+    videoPlayer.load();
+  }
+  if (a.hideSection && videoSection.style.display !== "none") {
+    videoSection.style.display = "none";
+    document.title = "YT Chromecast";
+  }
+  if (a.chip !== undefined) playGate.classList.toggle("visible", a.chip);
+  if (a.displayState) {
+    statusBar.textContent = a.statusText || a.displayState;
+    updatePlayPauseIcon();
+    if (a.displayState === "BUFFERING") showOverlay("Buffering...");
+    else if (a.displayState === "PLAYING" || a.displayState === "PAUSED") hideOverlay();
+  } else if (a.statusText) {
+    statusBar.textContent = a.statusText;
+  }
+  if (a.showControls) showControls();
+  if (a.progress) {
+    const pct = a.progress.duration > 0
+      ? Math.min(100, a.progress.time / a.progress.duration * 100) : 0;
+    progressFill.style.width = pct + "%";
+    timeElapsed.textContent = formatTime(a.progress.time);
+    timeDuration.textContent = formatTime(a.progress.duration);
+  }
+  if (a.volume && !volumeChanging) {
+    const vol = Math.round(a.volume.level * 100);
+    volumeSlider.value = vol;
+    volumePct.textContent = vol + "%";
+  }
+  if (a.command) {
+    api("/api/" + a.command.name, "POST", a.command.body)
+      .catch(e => showToast(e.message, true));
+  }
+}
+
+// Overlay
+function showOverlay(msg) {
+  overlayMsg.textContent = msg;
+  videoOverlay.classList.add("visible");
+}
+function hideOverlay() {
+  videoOverlay.classList.remove("visible");
+}
+
+// Idle-hide controls (like YouTube) — pure chrome; playback state comes
+// from the controller.
+let idleTimer = null;
+
+function showControls() {
+  videoControlsEl.classList.add("active");
+  videoWrap.classList.remove("hide-cursor");
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(hideControls, 3000);
+}
+
+function hideControls() {
+  // Don't hide while paused — user likely wants to see controls
+  if (ctrl.displayState() !== "PLAYING") return;
+  videoControlsEl.classList.remove("active");
+  videoWrap.classList.add("hide-cursor");
+}
+
+function updatePlayPauseIcon() {
+  playPauseIcon.innerHTML = ctrl.displayState() === "PLAYING" ? "&#x23F8;" : "&#x25B6;";
 }
 
 // Scan
@@ -659,9 +781,6 @@ scanBtn.addEventListener("click", async () => {
 });
 
 // File picker
-const fileInput = $("fileInput");
-const fileBtn = $("fileBtn");
-
 fileBtn.addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files[0];
@@ -671,8 +790,7 @@ fileInput.addEventListener("change", async () => {
 
   castBtn.disabled = true;
   castBtn.textContent = "Uploading...";
-  castingInProgress = true;
-  videoSection.style.display = "block";
+  apply(ctrl.castRequested(Date.now()));
   showOverlay("Uploading...");
 
   try {
@@ -685,24 +803,12 @@ fileInput.addEventListener("change", async () => {
 
     urlInput.value = file.name;
     showToast("Casting: " + data.title);
-    sync.noteCast(0, Date.now());
-    if (data.stream_url) {
-      localPlayerActive = true;
-      currentStreamUrl = data.stream_url;
-      videoPlayer.src = data.stream_url;
-      videoPlayer.muted = true;
-      videoPlayer.addEventListener("canplay", tryPlayPreview, { once: true });
-      videoTitle.textContent = data.title || "Now Playing";
-      document.title = data.title || "YT Chromecast";
-      videoSection.style.display = "block";
-      showControls();
-    }
+    apply(ctrl.castStarted(data, Date.now()));
   } catch (e) {
     showToast("Cast failed: " + e.message, true);
     hideOverlay();
-    if (!currentStreamUrl) videoSection.style.display = "none";
+    apply(ctrl.castFailed(Date.now()));
   } finally {
-    castingInProgress = false;
     castBtn.disabled = false;
     castBtn.textContent = "Cast";
     fileInput.value = "";
@@ -718,164 +824,46 @@ castBtn.addEventListener("click", async () => {
 
   castBtn.disabled = true;
   castBtn.textContent = "Casting...";
-  castingInProgress = true;
-  videoSection.style.display = "block";
+  apply(ctrl.castRequested(Date.now()));
   showOverlay("Loading...");
   try {
     const data = await api("/api/cast", "POST", { url, device_uuid });
     showToast("Casting: " + data.title);
-    // Note the cast even without a preview URL (m3u8): the post-cast IDLE
-    // grace must apply to every fresh cast.
-    sync.noteCast(data.start_time || 0, Date.now());
-    if (data.stream_url) {
-      localPlayerActive = true;
-      currentStreamUrl = data.stream_url;
-      videoPlayer.poster = data.thumbnail || "";
-      videoPlayer.src = data.stream_url;
-      videoPlayer.muted = true;
-      videoPlayer.addEventListener("canplay", tryPlayPreview, { once: true });
-      videoTitle.textContent = data.title || "Now Playing";
-      document.title = data.title || "YT Chromecast";
-      videoSection.style.display = "block";
-      showControls();
-      if (data.start_time > 0) {
-        programmaticSeek = true;
-        videoPlayer.currentTime = data.start_time;
-      }
-    }
+    apply(ctrl.castStarted(data, Date.now()));
   } catch (e) {
     showToast("Cast failed: " + e.message, true);
     hideOverlay();
-    if (!currentStreamUrl) videoSection.style.display = "none";
+    apply(ctrl.castFailed(Date.now()));
   } finally {
-    castingInProgress = false;
     castBtn.disabled = false;
     castBtn.textContent = "Cast";
   }
 });
 
-// Autoplay handling: browsers (notably Firefox with autoplay set to "Block
-// Audio and Video") reject play() without a user gesture, and that policy
-// cannot be bypassed from page code. Seeking is NOT blocked though — so when
-// play() is refused, the preview still shows live content by stepping the
-// paused video to the cast position on every status update (see
-// handleStatus). The chip offers a one-click upgrade to smooth playback.
-const playGate = $("playGate");
-let autoplayBlocked = false;
-
-function tryPlayPreview() {
-  videoPlayer.muted = true;
-  const p = videoPlayer.play();
-  if (p) p.then(() => {
-           autoplayBlocked = false;
-           playGate.classList.remove("visible");
-           // play() resolves only after loading/buffering, so playback begins
-           // where it was queued, not where the cast is NOW — without this the
-           // head start becomes permanent lag (too small for the drift snap).
-           const pos = sync.position(Date.now());
-           if (pos !== null && !videoPlayer.seeking &&
-               Math.abs(videoPlayer.currentTime - pos) > 0.5) {
-             programmaticSeek = true;
-             videoPlayer.currentTime = pos;
-           }
-         })
-         .catch(err => {
-           if (err && err.name === "NotAllowedError") {
-             autoplayBlocked = true;
-             playGate.classList.add("visible");
-           }
-         });
-}
-
+// The chip is the one-click upgrade to smooth playback while autoplay is
+// blocked (the controller keeps the preview tracking the cast via tick()).
 playGate.addEventListener("click", (e) => {
   e.stopPropagation();
   playGate.classList.remove("visible");
-  videoPlayer.muted = true;
-  videoPlayer.play().catch(() => {});
+  tryPlay();
 });
 
 videoPlayer.addEventListener("playing", () => {
-  autoplayBlocked = false;
-  playGate.classList.remove("visible");
+  apply(ctrl.playing(Date.now()));
 });
 
-// Any real gesture anywhere on the page unlocks smooth playback. play() must
-// be called inside the gesture handler: Firefox grants activation per-gesture
-// (not sticky like Chrome), so retrying from an SSE callback after a click
-// still fails — this capture listener is the only reliable unlock.
+// Any real gesture anywhere on the page can unlock smooth playback. play()
+// must be called inside the gesture handler (Firefox grants activation
+// per-gesture, not sticky) — apply() runs synchronously, so it is.
 function unlockOnGesture() {
-  if (!localPlayerActive || !currentStreamUrl || videoPlayer.error) return;
-  if ((currentState === "PLAYING" || currentState === "BUFFERING") &&
-      videoPlayer.paused && !videoPlayer.ended) {
-    // Start buffering from the live cast position, not the last stepped frame;
-    // tryPlayPreview corrects again once playback actually begins.
-    const pos = sync.position(Date.now());
-    if (pos !== null && videoPlayer.readyState >= 1 &&
-        Math.abs(videoPlayer.currentTime - pos) > 0.5) {
-      programmaticSeek = true;
-      videoPlayer.currentTime = pos;
-    }
-    tryPlayPreview();
-  }
+  apply(ctrl.gesture(snap(), Date.now()));
 }
 document.addEventListener("pointerdown", unlockOnGesture, true);
 document.addEventListener("keydown", unlockOnGesture, true);
 
-// While play() is refused, keep the paused preview tracking the cast clock —
-// a ~1fps slideshow driven by the extrapolated position, independent of SSE
-// cadence. Seeking a paused video is allowed even when playback isn't.
-setInterval(() => {
-  if (!localPlayerActive || !currentStreamUrl || videoPlayer.error) return;
-  if (!videoPlayer.paused || videoPlayer.seeking || videoPlayer.ended ||
-      videoPlayer.readyState < 1) return;
-  if (currentState !== "PLAYING") return;
-  const pos = sync.position(Date.now());
-  if (pos === null) return;
-  programmaticSeek = true;
-  videoPlayer.currentTime = pos;
-}, 1000);
-
-// Overlay
-function showOverlay(msg) {
-  overlayMsg.textContent = msg;
-  videoOverlay.classList.add("visible");
-}
-function hideOverlay() {
-  videoOverlay.classList.remove("visible");
-}
-
-// Optimistic UI update
-function optimisticState(state) {
-  currentState = state;
-  statusBar.textContent = state;
-  if (state === "BUFFERING") showOverlay("Buffering...");
-  else if (state === "PLAYING" || state === "PAUSED") hideOverlay();
-  // Show controls when paused, start idle timer when playing
-  if (state === "PAUSED") {
-    videoControlsEl.classList.add("active");
-    videoWrap.classList.remove("hide-cursor");
-    clearTimeout(idleTimer);
-  } else if (state === "PLAYING") {
-    showControls();
-  }
-}
-
-// Idle-hide controls (like YouTube)
-let idleTimer = null;
-
-function showControls() {
-  videoControlsEl.classList.add("active");
-  videoWrap.classList.remove("hide-cursor");
-  clearTimeout(idleTimer);
-  idleTimer = setTimeout(hideControls, 3000);
-}
-
-function hideControls() {
-  // Don't hide while paused — user likely wants to see controls
-  if (currentState !== "PLAYING") return;
-  videoControlsEl.classList.remove("active");
-  videoWrap.classList.add("hide-cursor");
-}
+// While play() is refused, the controller keeps the paused preview tracking
+// the cast clock — a ~1fps slideshow, independent of SSE cadence.
+setInterval(() => apply(ctrl.tick(snap(), Date.now())), 1000);
 
 // Mouse: show on move, hide after 3s idle
 videoWrap.addEventListener("mousemove", showControls);
@@ -919,128 +907,50 @@ videoControlsEl.addEventListener("click", (e) => {
 });
 
 // Center zone: play/pause toggle
-function updatePlayPauseIcon() {
-  playPauseIcon.innerHTML = currentState === "PLAYING" ? "&#x23F8;" : "&#x25B6;";
-}
-
 playPauseZone.addEventListener("click", (e) => {
   e.stopPropagation();
-  if (currentState === "PLAYING") {
-    sync.notePause(Date.now());
-    optimisticState("PAUSED");
-    videoPlayer.pause();
-    api("/api/pause", "POST").catch(e => showToast(e.message, true));
-  } else {
-    sync.notePlay(Date.now());
-    optimisticState("PLAYING");
-    videoPlayer.play().catch(() => {});
-    api("/api/play", "POST").catch(e => showToast(e.message, true));
-  }
-  updatePlayPauseIcon();
+  apply(ctrl.userPlayPause(Date.now()));
 });
 
 // Skip buttons (rewind / forward)
 document.querySelectorAll(".ctrl-btn[data-skip]").forEach(zone => {
   zone.addEventListener("click", (e) => {
     e.stopPropagation();
-    const delta = parseInt(zone.dataset.skip);
-    const dur = parseFloat(timeDuration.dataset.raw || 0);
-    // Base on the cast's clock, not the preview's — the preview may drift ±3s.
-    const cur = sync.position(Date.now()) ?? videoPlayer.currentTime ?? 0;
-    const pos = Math.max(0, Math.min(dur, cur + delta));
-    performSeek(pos);
+    apply(ctrl.userSeekBy(parseInt(zone.dataset.skip), snap(), Date.now()));
   });
 });
 
 // Stop
 stopBtn.addEventListener("click", (e) => {
   e.stopPropagation();
-  localPlayerActive = false;
-  optimisticState("IDLE");
-  playGate.classList.remove("visible");
-  videoPlayer.pause();
-  videoPlayer.removeAttribute("src");
-  videoPlayer.load();
-  videoSection.style.display = "none";
-  currentStreamUrl = "";
-  document.title = "YT Chromecast";
-  updatePlayPauseIcon();
-  api("/api/stop", "POST").catch(e => showToast(e.message, true));
+  apply(ctrl.userStop(Date.now()));
 });
 
-// Track page visibility — ignore video pause when page is hidden
-let pageHidden = false;
+// Tab woke up (sleeping tab / OS suspend may have paused the preview) —
+// the controller resumes it if the cast is still playing.
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    pageHidden = true;
-  } else {
-    // Delay reset so we don't catch the resume play event
-    setTimeout(() => pageHidden = false, 500);
-    // Tab woke up (sleeping tab / OS suspend may have paused the preview) —
-    // resume it if the cast is still playing.
-    if (localPlayerActive && currentStreamUrl && !videoPlayer.error &&
-        currentState === "PLAYING" && videoPlayer.paused && !videoPlayer.ended) {
-      tryPlayPreview();
-    }
-  }
+  if (!document.hidden) apply(ctrl.visibilityRestored(snap(), Date.now()));
 });
 
 // Clear overlay if local video fails to load (CDN URL may reject browser requests)
 videoPlayer.addEventListener("error", () => { hideOverlay(); });
 
-// Track browser seeking state
-videoPlayer.addEventListener("seeking", () => { isSeeking = true; });
+// Preview element events — the controller decides what (if anything) is
+// forwarded to the Chromecast (iOS native fullscreen controls only).
+videoPlayer.addEventListener("seeking", () => ctrl.previewSeeking());
 videoPlayer.addEventListener("seeked", () => {
-  isSeeking = false;
-  lastSeekTime = Date.now();
-  if (programmaticSeek) { programmaticSeek = false; return; }  // our controls — already sent to Chromecast
-  if (!currentStreamUrl) return;
-  // Only forward seeks made via native fullscreen controls (iOS) — same rule as
-  // pause/play below. Browser-internal seeks (e.g. rewind-to-0 when play() is
-  // called on an ended element) must never reach the Chromecast.
-  if (!isFullscreen()) return;
-  const pos = videoPlayer.currentTime;
-  sync.noteSeek(pos, Date.now());
-  const dur = parseFloat(timeDuration.dataset.raw || 0);
-  if (dur > 0) {
-    progressFill.style.width = (pos / dur * 100) + "%";
-  }
-  timeElapsed.textContent = formatTime(pos);
-  api("/api/seek", "POST", { position: pos }).catch(e => showToast(e.message, true));
+  apply(ctrl.previewSeeked(snap(), ctx(), Date.now()));
 });
-
-// Only forward native pause/play to Chromecast when in fullscreen
-// (iOS shows native controls in fullscreen — those should work)
-// Outside fullscreen, all control goes through our custom buttons
-function isFullscreen() {
-  return !!(document.fullscreenElement || document.webkitFullscreenElement || videoPlayer.webkitDisplayingFullscreen);
-}
-
 videoPlayer.addEventListener("pause", () => {
-  if (!isFullscreen()) return;
-  if (!currentStreamUrl || isSeeking || programmaticSeek) return;
-  if (Date.now() - lastSeekTime < 2000) return;  // suppress pause fired after seek
-  if (currentState === "PAUSED" || currentState === "IDLE") return;
-  sync.notePause(Date.now());
-  optimisticState("PAUSED");
-  updatePlayPauseIcon();
-  api("/api/pause", "POST").catch(e => showToast(e.message, true));
+  apply(ctrl.nativePause(ctx(), Date.now()));
 });
-
 videoPlayer.addEventListener("play", () => {
-  if (!currentStreamUrl || isSeeking || programmaticSeek) return;
-  if (currentState === "PLAYING") return;
-  optimisticState("PLAYING");
-  updatePlayPauseIcon();
-  if (!isFullscreen()) return;  // only forward to Chromecast when in fullscreen (iOS native controls)
-  sync.notePlay(Date.now());
-  api("/api/play", "POST").catch(e => showToast(e.message, true));
+  apply(ctrl.nativePlay(ctx(), Date.now()));
 });
 
 // Volume
 let volumeTimeout;
 let prevVolume = 50;
-const muteBtn = $("muteBtn");
 
 volumeSlider.addEventListener("input", (e) => {
   e.stopPropagation();
@@ -1068,8 +978,6 @@ muteBtn.addEventListener("click", (e) => {
 });
 
 // Fullscreen (with iOS/webkit fallbacks)
-const fsBtn = $("fsBtn");
-
 function toggleFullscreen() {
   if (document.fullscreenElement || document.webkitFullscreenElement) {
     (document.exitFullscreen || document.webkitExitFullscreen).call(document);
@@ -1089,12 +997,10 @@ fsBtn.addEventListener("click", (e) => {
 });
 
 // Seek tooltip on progress bar hover
-const seekTooltip = $("seekTooltip");
-
 progressBar.addEventListener("mousemove", (e) => {
   const rect = progressBar.getBoundingClientRect();
   const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  const dur = ctrl.duration();
   if (dur > 0) {
     seekTooltip.textContent = formatTime(pct * dur);
     seekTooltip.style.left = (pct * 100) + "%";
@@ -1111,121 +1017,19 @@ progressBar.addEventListener("click", (e) => {
   e.stopPropagation();
   const rect = progressBar.getBoundingClientRect();
   const pct = (e.clientX - rect.left) / rect.width;
-  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  const dur = ctrl.duration();
   if (dur > 0) {
-    performSeek(pct * dur);
+    apply(ctrl.userSeekTo(pct * dur, snap(), Date.now()));
   }
 });
 
-// SSE status stream
-function handleStatus(s) {
-  const prevState = currentState;
-
-  if (s.connected && s.state !== "IDLE" && s.state !== "UNKNOWN") {
-    // Let the sync engine reconcile server status against the preview and
-    // any still-pending user action (pause/play/seek/cast) — this is what
-    // stops stale SSE echoes from bouncing the UI.
-    const act = sync.reconcile(s, {
-      currentTime: videoPlayer.currentTime || 0,
-      paused: videoPlayer.paused,
-      ended: videoPlayer.ended,
-      seeking: videoPlayer.seeking,
-      readyState: videoPlayer.readyState,
-      error: videoPlayer.error,
-    }, Date.now());
-
-    currentState = act.displayState;
-    statusBar.textContent = act.displayState;
-    updatePlayPauseIcon();
-
-    // Overlay for loading/buffering states
-    if (act.displayState === "BUFFERING") showOverlay("Buffering...");
-    else if (act.displayState === "PLAYING" || act.displayState === "PAUSED") hideOverlay();
-
-    // Show controls when transitioning into PLAYING (e.g. SSE fires before play event)
-    if (act.displayState === "PLAYING" && prevState !== "PLAYING") showControls();
-
-    // Progress — progressTime holds a pending seek target instead of a stale position
-    if (!isSeeking) {
-      const pct = s.duration > 0 ? Math.min(100, act.progressTime / s.duration * 100) : 0;
-      progressFill.style.width = pct + "%";
-      timeElapsed.textContent = formatTime(act.progressTime);
-      timeDuration.textContent = formatTime(s.duration);
-      timeDuration.dataset.raw = s.duration;
-    }
-
-    // Volume
-    if (!volumeChanging) {
-      const vol = Math.round(s.volume * 100);
-      volumeSlider.value = vol;
-      volumePct.textContent = vol + "%";
-    }
-
-    // Title/section visible whenever something is playing
-    if (s.stream_url) {
-      videoTitle.textContent = s.title || "Now Playing";
-      document.title = s.title || "YT Chromecast";
-      videoSection.style.display = "block";
-    }
-
-    // Load local video only when user cast this session (avoids competing for CDN session on refresh)
-    if (localPlayerActive && s.stream_url && s.stream_url !== currentStreamUrl) {
-      currentStreamUrl = s.stream_url;
-      videoPlayer.poster = s.thumbnail || "";
-      videoPlayer.src = s.stream_url;
-      videoPlayer.muted = true;
-      if (s.state === "PLAYING") tryPlayPreview();
-    }
-
-    // Apply the engine's corrective actions to the preview element. All the
-    // guards (drift threshold, snap rate limit, pending seeks, post-cast
-    // grace, ended/error protection) live in player-sync.js, where they're
-    // unit-tested.
-    if (localPlayerActive && currentStreamUrl && !videoPlayer.error) {
-      if (act.snapTo !== null) {
-        programmaticSeek = true;
-        videoPlayer.currentTime = act.snapTo;
-      }
-      if (act.play) {
-        tryPlayPreview();
-      } else if (act.pause) {
-        videoPlayer.pause();
-      }
-      // When play() is refused the preview still tracks the cast: the 1s
-      // stepping interval above seeks the paused video to the live position.
-    }
-  } else {
-    currentState = s.state;
-    statusBar.textContent = s.connected ? "Idle" : "Not connected";
-    // Cast stopped or ended (possibly from another device) — clear the preview
-    // on every open window, including ones that never loaded a stream (cast
-    // started elsewhere, m3u8 casts with no preview URL). The engine ignores
-    // the receiver's transient IDLE while a fresh cast is still loading —
-    // tearing down on that echo left the preview black until refresh.
-    if ((s.state === "IDLE" || !s.connected) && !castingInProgress &&
-        sync.shouldClearOnIdle(Date.now())) {
-      localPlayerActive = false;
-      playGate.classList.remove("visible");
-      if (currentStreamUrl) {
-        videoPlayer.pause();
-        videoPlayer.removeAttribute("src");
-        videoPlayer.load();
-        currentStreamUrl = "";
-      }
-      if (videoSection.style.display !== "none") {
-        videoSection.style.display = "none";
-        document.title = "YT Chromecast";
-      }
-    }
-  }
-}
-
-// Defer SSE connection so iOS Safari doesn't show infinite loading spinner
+// SSE status stream — every status goes through the controller.
+// Defer the connection so iOS Safari doesn't show an infinite loading spinner.
 let evtSource;
 window.addEventListener("load", () => {
   evtSource = new EventSource("/api/events");
   evtSource.onmessage = (e) => {
-    try { handleStatus(JSON.parse(e.data)); } catch {}
+    try { apply(ctrl.handleStatus(JSON.parse(e.data), snap(), Date.now())); } catch {}
   };
   evtSource.onerror = () => { statusBar.textContent = "Connection lost — reconnecting..."; };
 });
@@ -1246,15 +1050,17 @@ document.addEventListener("keydown", (e) => {
   // Don't capture with modifiers (let browser shortcuts work)
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   // Only act if video is active
-  if (!currentStreamUrl) return;
+  if (!ctrl.hasStream()) return;
 
-  const dur = parseFloat(timeDuration.dataset.raw || 0);
+  const dur = ctrl.duration();
   let handled = true;
 
-  function doSeek(delta) {
-    // Base on the cast's clock (falls back to the preview if no status yet).
-    const cur = sync.position(Date.now()) ?? videoPlayer.currentTime ?? 0;
-    performSeek(Math.max(0, Math.min(dur, cur + delta)));
+  function seekBy(delta) {
+    apply(ctrl.userSeekBy(delta, snap(), Date.now()));
+  }
+
+  function seekTo(pos) {
+    apply(ctrl.userSeekTo(pos, snap(), Date.now()));
   }
 
   function doVolume(delta) {
@@ -1279,19 +1085,19 @@ document.addEventListener("keydown", (e) => {
 
     // Seek — Arrow keys, J/L
     case "ArrowLeft":
-      doSeek(-5);
+      seekBy(-5);
       showControls();
       break;
     case "ArrowRight":
-      doSeek(5);
+      seekBy(5);
       showControls();
       break;
     case "j":
-      doSeek(-10);
+      seekBy(-10);
       showControls();
       break;
     case "l":
-      doSeek(10);
+      seekBy(10);
       showControls();
       break;
 
@@ -1325,18 +1131,18 @@ document.addEventListener("keydown", (e) => {
     case "0": case "1": case "2": case "3": case "4":
     case "5": case "6": case "7": case "8": case "9":
       if (dur > 0) {
-        performSeek(parseInt(e.key) / 10 * dur);
+        seekTo(parseInt(e.key) / 10 * dur);
         showControls();
       }
       break;
 
     // Home/End — jump to start/end
     case "Home":
-      performSeek(0);
+      seekTo(0);
       showControls();
       break;
     case "End":
-      if (dur > 0) performSeek(dur - 1);
+      if (dur > 0) seekTo(dur - 1);
       showControls();
       break;
 
@@ -1366,32 +1172,9 @@ document.addEventListener("keydown", (e) => {
       });
     }
 
-    // Restore active playback — wire up video element directly, then call handleStatus for UI sync.
-    if (s.playback && s.playback.connected && s.playback.state !== "IDLE" && s.playback.state !== "UNKNOWN") {
-      if (s.playback.stream_url) {
-        localPlayerActive = true;
-        // Same grace as a fresh cast: don't mirror transient states while
-        // the preview loads and seeks to the restored position.
-        sync.noteCast(0, Date.now());
-        currentStreamUrl = s.playback.stream_url;
-        videoPlayer.poster = s.playback.thumbnail || "";
-        videoPlayer.muted = true;
-        videoPlayer.src = s.playback.stream_url;
-        // Seek to current position once metadata is ready, then let SSE play-sync trigger play().
-        const restoreTime = s.playback.current_time || 0;
-        if (restoreTime > 0) {
-          videoPlayer.addEventListener("loadedmetadata", () => {
-            programmaticSeek = true;
-            videoPlayer.currentTime = restoreTime;
-          }, { once: true });
-        }
-        videoTitle.textContent = s.playback.title || "Now Playing";
-        document.title = s.playback.title || "YT Chromecast";
-        videoSection.style.display = "block";
-        showControls();
-      }
-      handleStatus(s.playback);
-    }
+    // Adopt active playback: the controller wires up the preview (with the
+    // fresh-cast grace + restore seek) and mirrors the status in one shot.
+    if (s.playback) apply(ctrl.restore(s.playback, snap(), Date.now()));
   } catch {}
 })();
 </script>
