@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
 
 # pip --prefix leftovers — deps belong in the user/global site-packages
 Lib/

@@ -55,6 +55,28 @@ To access from other devices on your network (e.g. phone), use your PC's IP: `ht
 - Multi-device sync — control from desktop and phone simultaneously
 - Mobile-friendly with touch support and double-tap fullscreen
 
+## Tests
+
+Backend (Flask + SSE broadcast behavior, faked Chromecast):
+
+```
+pip install pytest
+python -m pytest tests/
+```
+
+Frontend sync engine (`static/js/player-sync.js` — reconciles Chromecast status with the local preview):
+
+```
+node --test 'tests/*.test.mjs'
+```
+
+Manual testing without a real Chromecast — a simulated device that confirms
+commands with realistic latency:
+
+```
+VIDEOCAST_STATE_FILE=/tmp/sim-state.json python tests/sim_server.py 5058
+```
+
 ## Auto-Start (Windows)
 
 Double-click `start.vbs` to run the server in the background, or place it in `shell:startup` to launch on login.

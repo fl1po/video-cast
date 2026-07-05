@@ -22,7 +22,12 @@ for _node_path in [
 
 app = Flask(__name__)
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+STATE_FILE = os.environ.get("VIDEOCAST_STATE_FILE") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+# SSE broadcast poll intervals (seconds); overridable for tests
+SSE_POLL_PLAYING = float(os.environ.get("VIDEOCAST_SSE_POLL_PLAYING", "2"))
+SSE_POLL_IDLE = float(os.environ.get("VIDEOCAST_SSE_POLL_IDLE", "5"))
 
 
 def get_lan_ip():
@@ -335,11 +340,11 @@ def sse_broadcaster():
         if cc:
             try:
                 state = cc.media_controller.status.player_state
-                timeout = 2 if state == "PLAYING" else 5
+                timeout = SSE_POLL_PLAYING if state == "PLAYING" else SSE_POLL_IDLE
             except Exception:
-                timeout = 5
+                timeout = SSE_POLL_IDLE
         else:
-            timeout = 5
+            timeout = SSE_POLL_IDLE
         status_changed.wait(timeout=timeout)
         status_changed.clear()
         broadcast_status()
@@ -640,8 +645,9 @@ def play():
     cc = cast_device
     if not cc:
         return jsonify({"error": "No active cast"}), 400
+    # See /api/pause: broadcast happens when the device confirms, not now.
     cc.media_controller.play()
-    status_changed.set()
+    cc.media_controller.update_status()
     return jsonify({"status": "playing"})
 
 
@@ -650,8 +656,13 @@ def pause():
     cc = cast_device
     if not cc:
         return jsonify({"error": "No active cast"}), 400
+    # No status_changed.set() here: pychromecast's cached status is still the
+    # pre-command state, so broadcasting now would echo stale data to clients.
+    # The media status listener fires (and broadcasts) when the device confirms;
+    # update_status (GET_STATUS) prompts that reply from devices that are slow
+    # to push it on their own.
     cc.media_controller.pause()
-    status_changed.set()
+    cc.media_controller.update_status()
     return jsonify({"status": "paused"})
 
 
@@ -682,8 +693,9 @@ def volume():
     if level is None:
         return jsonify({"error": "No volume level provided"}), 400
     level = max(0.0, min(1.0, float(level)))
+    # See /api/pause: the cast status listener broadcasts once the device
+    # reports the new volume.
     cc.set_volume(level)
-    status_changed.set()
     return jsonify({"volume": level})
 
 
@@ -710,7 +722,8 @@ def seek():
             mc.play()
     except Exception:
         pass
-    status_changed.set()
+    # See /api/pause: broadcast happens when the device confirms, not now.
+    mc.update_status()
     return jsonify({"position": position})
 
 
