@@ -200,6 +200,33 @@ test("playRefused shows the chip; playing hides it", () => {
   assert.equal(ctrl.playing(12_000).chip, false);
 });
 
+test("a fresh cast withholds autoplay until the device confirms PLAYING, then starts in sync", () => {
+  const ctrl = createPreviewController();
+  ctrl.castRequested(9_900);
+  const started = ctrl.castStarted({ stream_url: "http://cdn/v.mp4", title: "Video", start_time: 0 }, 10_000);
+  assert.equal(started.setSrc, "http://cdn/v.mp4", "preview still loads immediately");
+  assert.equal(started.playWhenReady, undefined, "but must not autoplay on canplay");
+
+  // The receiver is still connecting/buffering -- must not start the preview
+  // even though it has long since finished loading locally.
+  const buffering = ctrl.handleStatus(
+    activeStatus(0, { state: "BUFFERING" }), pausedLocal(0), 10_500);
+  assert.equal(buffering.play, undefined);
+
+  // The device finally confirms PLAYING, already 1.4s in (normal cast
+  // startup latency) -- well under DRIFT_THRESHOLD_S(3), the gap that used
+  // to slip through uncorrected because playWhenReady had already started
+  // the preview from 0 with nothing to reconcile it against.
+  const confirmed = ctrl.handleStatus(activeStatus(1.4), pausedLocal(0), 12_800);
+  assert.equal(confirmed.seekTo, 1.4, "preview starts from the real position, not 0");
+  assert.equal(confirmed.play, true);
+
+  // Once resolved, later statuses go through the normal mirror/snap path.
+  const steady = ctrl.handleStatus(activeStatus(2.4), local(2.4), 13_800);
+  assert.equal(steady.seekTo, undefined);
+  assert.equal(steady.play, undefined);
+});
+
 test("playStarted corrects the head start so it doesn't become permanent lag", () => {
   const ctrl = castCtrl(10_000);
   ctrl.handleStatus(activeStatus(100), pausedLocal(100), 10_000);

@@ -47,6 +47,12 @@
     var seeking = false;     // preview element is mid-seek
     var lastSeekAt = -Infinity;
     var expectProgrammaticSeeked = false; // next seeked event is ours, not the user's
+    // A fresh cast from position 0: the preview's own buffer often fills
+    // faster than the Chromecast connects and starts, so autoplaying on
+    // canplay gives it a head start too small for the drift snap to ever
+    // catch. Held until the device's first confirmed PLAYING status, so the
+    // preview's first frame starts from the real position instead.
+    var pendingFreshPlay = false;
 
     function seekActions(pos, local, now) {
       sync.noteSeek(pos, now);
@@ -91,9 +97,19 @@
           }
           // The engine's corrective actions (drift snap, mirror play/pause).
           if (localActive && streamUrl && !local.error) {
-            if (r.snapTo !== null) act.seekTo = r.snapTo;
-            if (r.play) act.play = true;
-            else if (r.pause) act.pause = true;
+            if (pendingFreshPlay) {
+              // Still BUFFERING (or similar) — keep withholding play until
+              // the device is actually PLAYING, not just connected.
+              if (state === "PLAYING") {
+                pendingFreshPlay = false;
+                act.seekTo = r.progressTime;
+                act.play = true;
+              }
+            } else {
+              if (r.snapTo !== null) act.seekTo = r.snapTo;
+              if (r.play) act.play = true;
+              else if (r.pause) act.pause = true;
+            }
           }
         } else {
           state = server.state;
@@ -107,6 +123,7 @@
           if ((server.state === "IDLE" || !server.connected) && !casting &&
               sync.shouldClearOnIdle(now)) {
             localActive = false;
+            pendingFreshPlay = false;
             act.chip = false;
             if (streamUrl) {
               streamUrl = "";
@@ -163,17 +180,23 @@
           streamUrl = result.stream_url;
           act.setSrc = result.stream_url;
           act.poster = result.thumbnail || "";
-          act.playWhenReady = true;
           act.title = result.title || "";
           act.showSection = true;
           act.showControls = true;
-          if (result.start_time > 0) act.seekTo = result.start_time;
+          if (result.start_time > 0) {
+            act.playWhenReady = true;
+            act.seekTo = result.start_time;
+          } else {
+            // Load the preview but don't autoplay yet — see pendingFreshPlay.
+            pendingFreshPlay = true;
+          }
         }
         return act;
       },
 
       castFailed: function (now) {
         casting = false;
+        pendingFreshPlay = false;
         return { hideSection: !streamUrl };
       },
 
@@ -207,6 +230,7 @@
 
       userStop: function (now) {
         localActive = false;
+        pendingFreshPlay = false;
         streamUrl = "";
         state = "IDLE";
         return {
