@@ -28,12 +28,20 @@ class NoActiveCast(Exception):
 
 @dataclass
 class MediaSource:
-    """The resolved thing a cast plays."""
+    """The resolved thing a cast plays. stream_url is what the Device plays;
+    preview_url is a browser-playable progressive URL for the muted Preview."""
     stream_url: str
     title: str = ""
     thumbnail: str = ""
     mime: str = "video/mp4"
     local_path: str = None  # set when we serve the file ourselves (/api/media)
+    preview_url: str = None
+
+    def __post_init__(self):
+        # A progressive stream previews as itself; HLS has no browser-playable
+        # preview unless the resolver picked a dedicated progressive URL.
+        if self.preview_url is None and self.mime == "video/mp4":
+            self.preview_url = self.stream_url
 
 
 # The receiver keeps reporting IDLE for a while after play_media (the cast
@@ -71,7 +79,7 @@ class CastSession:
         self.last_position = store.get("last_position", 0)
         self.media_title = store.get("media_title")
         self.media_thumbnail = store.get("media_thumbnail")
-        self.media_stream_url = store.get("media_stream_url")
+        self.media_preview_url = store.get("media_preview_url")
 
     # ── interface ────────────────────────────────────────────────────────
 
@@ -87,14 +95,13 @@ class CastSession:
         try:
             with self._lock:
                 ms = device.media_status
-                stream_url = self.media_stream_url
                 return {
                     "connected": True,
                     "state": ms.player_state or "UNKNOWN",
                     "title": self.media_title or ms.title or "",
                     "thumbnail": self.media_thumbnail or "",
-                    # m3u8 streams have no browser-playable preview URL
-                    "stream_url": stream_url if stream_url and "m3u8" not in stream_url else "",
+                    # the Preview's URL, not the Device's (wire name is legacy)
+                    "stream_url": self.media_preview_url or "",
                     "current_time": ms.adjusted_current_time or ms.current_time or 0,
                     "duration": ms.duration or 0,
                     "volume": device.volume_level,
@@ -116,7 +123,7 @@ class CastSession:
                 self.last_position = 0
                 self.media_title = source.title
                 self.media_thumbnail = source.thumbnail
-                self.media_stream_url = source.stream_url
+                self.media_preview_url = source.preview_url
                 self._local_file_path = source.local_path
                 self.last_cast_at = self._now()
 
@@ -139,7 +146,7 @@ class CastSession:
             self.last_position = 0
             self.media_title = None
             self.media_thumbnail = None
-            self.media_stream_url = None
+            self.media_preview_url = None
         device.stop()
         self.wake()
         self.persist()
@@ -204,7 +211,7 @@ class CastSession:
             last_url=self.last_url,
             media_title=self.media_title,
             media_thumbnail=self.media_thumbnail,
-            media_stream_url=self.media_stream_url,
+            media_preview_url=self.media_preview_url,
             last_position=self.last_position,
         )
 
@@ -265,7 +272,7 @@ class CastSession:
             # Re-resolve: the old stream URL has likely expired
             source = self._resolve_source(self.last_url)
             with self._lock:
-                self.media_stream_url = source.stream_url
+                self.media_preview_url = source.preview_url
                 self.media_title = source.title
                 self.media_thumbnail = source.thumbnail
                 self.last_cast_at = self._now()
@@ -284,14 +291,18 @@ class CastSession:
             self._resume_lock.release()
 
     def _seek_when_ready(self, device, position):
-        """A fresh cast ignores seeks until the receiver is active — retry
-        until it takes (URL timestamps like ?t=90)."""
+        """A fresh cast silently drops seeks until the receiver is actually
+        playing (HLS receivers even drop them while BUFFERING on load) —
+        keep seeking until the position sticks (URL timestamps like ?t=90)."""
         for _ in range(60):
             try:
-                if device.media_status.player_state in ("PLAYING", "BUFFERING", "PAUSED"):
-                    device.seek(position)
+                ms = device.media_status
+                pos = ms.adjusted_current_time or ms.current_time or 0
+                if pos >= position - 5:
                     self.wake()
                     return
+                if ms.player_state in ("PLAYING", "PAUSED"):
+                    device.seek(position)
             except Exception:
                 pass
             self._sleep(0.5)

@@ -25,7 +25,7 @@ Fans the Cast Session's status out to SSE subscribers; wakes on device events (`
 _Avoid_: SSE machinery, event bus
 
 **Media Source**:
-The resolved thing a cast plays: `{stream_url, title, thumbnail, mime}`, produced from a page URL (via yt-dlp), a direct stream URL, an uploaded file, or an m3u playlist. The Cast Session receives a `resolve_source(url) → Media Source` callable for auto-resume; the deep resolver is a planned separate module.
+The resolved thing a cast plays: `{stream_url, preview_url, title, thumbnail, mime}`, produced from a page URL (via yt-dlp), a direct stream URL, an uploaded file, or an m3u playlist. `stream_url` is what the Device plays (best muxed format, usually HLS for YouTube); `preview_url` is a browser-playable progressive URL for the muted Preview (empty when none exists — the Preview then stays down). The Cast Session receives a `resolve_source(url) → Media Source` callable for auto-resume; the deep resolver is a planned separate module.
 _Avoid_: stream info, video info
 
 **Preview**:
@@ -51,6 +51,7 @@ _Avoid_: (don't paraphrase — this is a load-bearing invariant, name it)
 ## Flagged ambiguities
 
 - **"casting in progress"** exists as both the server flag (suppresses auto-resume during setup) and the page flag (suppresses Preview teardown while the cast API call is in flight). Same phrase, two different windows on two sides of the seam. When speaking precisely, say *server cast-setup flag* vs *page cast-request flag*. Candidate under consideration: publish `loading` in the status interface and delete the page flag.
+- **`stream_url` on the wire** (SSE status, `/api/cast` responses) carries the Media Source's `preview_url`, not its `stream_url` — the field predates the split and the page already treats it as "the Preview's URL". Renaming the wire field would touch the Preview Controller for no behavior change; do it only alongside other protocol work.
 
 ## Example dialogue
 

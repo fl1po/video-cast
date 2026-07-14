@@ -179,3 +179,43 @@ def test_controls_require_an_active_cast(tmp_path):
         session.play()
     with pytest.raises(NoActiveCast):
         session.stop()
+
+
+class SlowLoadingDevice(FakeDevice):
+    """Buffers for a few ticks after play_media, silently dropping seeks
+    until it reaches PLAYING — how a real receiver loads an HLS cast."""
+
+    def __init__(self, load_ticks):
+        super().__init__()
+        self.media_status.player_state = "BUFFERING"
+        self.media_status.current_time = 0
+        self.media_status.adjusted_current_time = 0
+        self._load_ticks = load_ticks
+
+    def tick(self):
+        if self._load_ticks > 0:
+            self._load_ticks -= 1
+            if self._load_ticks == 0:
+                self.media_status.player_state = "PLAYING"
+
+    def seek(self, position):
+        super().seek(position)
+        if self.media_status.player_state == "PLAYING":  # honored only now
+            self.media_status.current_time = position
+            self.media_status.adjusted_current_time = position
+
+
+def test_start_time_survives_the_receiver_load_window(tmp_path):
+    """The ?t= seek must stick even though the receiver drops every seek
+    sent while it is still BUFFERING on load."""
+    device = SlowLoadingDevice(load_ticks=3)
+    session, clock = make_session(tmp_path, device)
+    session._sleep = lambda s: device.tick()  # loop ticks drive the load
+
+    session.note_attempt("https://example.com/watch?v=1&t=90")
+    session.start(SOURCE, "TV", start_time=90)
+
+    assert ("seek", 90) in device.commands
+    assert device.media_status.current_time == 90
+    # once the position sticks, the loop stops issuing seeks
+    assert device.commands.count(("seek", 90)) == 1
