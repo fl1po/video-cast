@@ -43,10 +43,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 
 # YouTube has all but retired progressive (video+audio) formats — 720p mp4
-# (22) is gone and 360p (18) comes and goes. Muxed HLS reaches 1080p and the
-# Chromecast plays it natively; the Preview gets its own progressive URL
-# (pick_preview_url) since browsers can't play those manifests.
-YT_DLP_FORMAT = "best[protocol^=m3u8][height<=1080]/best[height<=720]/best"
+# (22) is gone and 360p (18) comes and goes. Muxed HLS is what the Chromecast
+# plays natively; the Preview gets its own progressive URL (pick_preview_url)
+# since browsers can't play those manifests.
+# The receiver silently refuses renditions above MAX_CAST_HEIGHT: it fetches
+# the manifest and the first segment, then answers LOAD_FAILED with
+# idleReason=ERROR, leaving the Cast Session at IDLE with duration 0 and
+# nothing in the log. Measured on the Living Room TV (Android box, Default
+# Media Receiver): 1080p fails at any frame rate — level 4.0 (avc1.640028,
+# 1080p25) and level 4.2 (avc1.64002A, 1080p50) alike — while 720p plays at
+# both 25 and 50fps (levels 3.1/3.2). The ceiling is per-device, so it is
+# overridable rather than baked into the selector.
+MAX_CAST_HEIGHT = int(os.environ.get("VIDEOCAST_MAX_HEIGHT", "720"))
+YT_DLP_FORMAT = (
+    f"best[protocol^=m3u8][height<={MAX_CAST_HEIGHT}]/"
+    f"best[height<={MAX_CAST_HEIGHT}]/best"
+)
 YT_DLP_OPTS = {
     "format": YT_DLP_FORMAT,
     "quiet": True,

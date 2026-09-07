@@ -22,6 +22,7 @@ commands never synthesize events. The No-Echo Rule depends on this.
 import time
 
 import pychromecast
+from pychromecast.controllers.media import STREAM_TYPE_BUFFERED
 
 
 class ConnectError(Exception):
@@ -51,7 +52,13 @@ class PychromecastDevice:
         self._cc = cc
 
     def play_media(self, url, mime, title="", thumb=""):
-        self._cc.media_controller.play_media(url, mime, title=title, thumb=thumb)
+        # stream_type must be passed explicitly: pychromecast 14 changed
+        # play_media's default from BUFFERED to LIVE, and the receiver
+        # rejects a VOD source announced as LIVE — it fetches the manifest
+        # and first segment, then answers LOAD_FAILED / idleReason=ERROR.
+        # LIVE would also drop duration, which the UI and seek depend on.
+        self._cc.media_controller.play_media(url, mime, title=title, thumb=thumb,
+                                             stream_type=STREAM_TYPE_BUFFERED)
 
     def block_until_active(self, timeout=None):
         self._cc.media_controller.block_until_active(timeout=timeout)
