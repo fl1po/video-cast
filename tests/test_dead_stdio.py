@@ -12,9 +12,8 @@ opt) is dead-stdio-safe — logging swallows stream errors by design."""
 import sys
 
 import pytest
-import yt_dlp
 
-import app as videocast
+from mediasource import ResolveError, YtDlpExtractor
 
 
 class DeadStdio:
@@ -34,13 +33,12 @@ class DeadStdio:
 def test_resolver_failure_surfaces_real_error_despite_dead_stdio(monkeypatch):
     # cookiesfrombrowser needs a Firefox profile on the test machine —
     # machine-dependent and irrelevant to the error-masking pattern under test.
-    opts = {k: v for k, v in videocast.YT_DLP_OPTS.items() if k != "cookiesfrombrowser"}
-    monkeypatch.setattr(videocast, "YT_DLP_OPTS", opts)
+    extract = YtDlpExtractor(cookies_from_browser=None)
     monkeypatch.setattr(sys, "stdout", DeadStdio())
     monkeypatch.setattr(sys, "stderr", DeadStdio())
 
     # .invalid never resolves (RFC 6761): extraction fails fast with or
-    # without a network, and the resolver must report THAT failure — not the
+    # without a network, and the adapter must report THAT failure — not the
     # stdio corpse yt-dlp tried to print it to.
-    with pytest.raises(yt_dlp.utils.DownloadError):
-        videocast.resolve_with_ytdlp("https://nonexistent.invalid/video")
+    with pytest.raises(ResolveError, match="yt-dlp"):
+        extract("https://nonexistent.invalid/video")

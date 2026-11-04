@@ -4,8 +4,7 @@ intentional, plus the policies that act on it.
 
 Interface:
 
-    session.note_attempt(url)                # remember the user's last try
-    session.start(source, device_name, start_time=0)   # raises on failure
+    session.cast(ref, device_name) -> MediaSource   # raises ResolveError / on failure
     session.stop() / .play() / .pause() / .seek(pos) / .set_volume(level)
     session.status() -> dict                 # the SSE/status payload
     session.media_file_path()                # local file served at /api/media
@@ -13,35 +12,25 @@ Interface:
     session.wake                             # set to the broadcaster's wake()
 
 Everything else — position tracking, the intentional-stop flag, the
-Post-Cast Idle Grace, the auto-resume policy, persistence — is
-implementation. Control commands never wake the broadcaster (the No-Echo
+Post-Cast Idle Grace, the auto-resume policy, the Resume Ref, persistence —
+is implementation. Media Refs resolve through the injected Media Source
+Resolver (mediasource.py), on first cast and on auto-resume alike. Control commands never wake the broadcaster (the No-Echo
 Rule): the device's own confirmation event does.
 """
+import logging
 import threading
 import time
-from dataclasses import dataclass
+
+from mediasource import MediaRef, ResolveError
+
+log = logging.getLogger(__name__)
+
+
+_MISSING = object()
 
 
 class NoActiveCast(Exception):
     pass
-
-
-@dataclass
-class MediaSource:
-    """The resolved thing a cast plays. stream_url is what the Device plays;
-    preview_url is a browser-playable progressive URL for the muted Preview."""
-    stream_url: str
-    title: str = ""
-    thumbnail: str = ""
-    mime: str = "video/mp4"
-    local_path: str = None  # set when we serve the file ourselves (/api/media)
-    preview_url: str = None
-
-    def __post_init__(self):
-        # A progressive stream previews as itself; HLS has no browser-playable
-        # preview unless the resolver picked a dedicated progressive URL.
-        if self.preview_url is None and self.mime == "video/mp4":
-            self.preview_url = self.stream_url
 
 
 # The receiver keeps reporting IDLE for a while after play_media (the cast
@@ -51,12 +40,12 @@ IDLE_GRACE_S = 15
 
 
 class CastSession:
-    def __init__(self, platform, resolve_source, store, *,
+    def __init__(self, platform, resolver, store, *,
                  idle_grace_s=IDLE_GRACE_S, resume_cooldown_s=30,
                  resume_settle_s=5, now=time.time, sleep=time.sleep,
                  spawn=None):
         self._platform = platform
-        self._resolve_source = resolve_source
+        self._resolver = resolver
         self._store = store
         self._idle_grace_s = idle_grace_s
         self._resume_cooldown_s = resume_cooldown_s
@@ -75,7 +64,17 @@ class CastSession:
 
         self.intentional_stop = False
         self.last_cast_at = 0.0
+        # last_url: what the user last typed (pre-fills the URL box, even if
+        # its cast failed). resume_ref: the last cast that actually started.
         self.last_url = store.get("last_url", "")
+        stored_ref = store.get("resume_ref", _MISSING)
+        self.resume_ref = MediaRef.from_dict(stored_ref)
+        if stored_ref is _MISSING:
+            # state.json from before the Resume Ref: last_url was both, and
+            # held a bare filename after an upload.
+            self.resume_ref = resolver.legacy_ref(self.last_url)
+        if "://" not in self.last_url:
+            self.last_url = ""
         self.last_position = store.get("last_position", 0)
         self.media_title = store.get("media_title")
         self.media_thumbnail = store.get("media_thumbnail")
@@ -83,10 +82,18 @@ class CastSession:
 
     # ── interface ────────────────────────────────────────────────────────
 
-    def note_attempt(self, url):
-        """Remember what the user last tried to cast (prefills the UI and
-        feeds auto-resume), even if the cast then fails."""
-        self.last_url = url
+    def cast(self, ref, device_name):
+        """Resolve a Media Ref and cast it; on success it becomes the Resume
+        Ref. Raises ResolveError (user-facing) or the connect/load failure."""
+        if ref.kind == "url":
+            self.last_url = ref.value
+        self._casting = True  # covers resolution too: no auto-resume mid-setup
+        try:
+            source = self._resolver.resolve(ref)
+            self._start(source, device_name, ref)
+            return source
+        finally:
+            self._casting = False
 
     def status(self):
         device = self._device
@@ -110,8 +117,8 @@ class CastSession:
         except Exception:
             return {"state": "IDLE", "connected": False}
 
-    def start(self, source, device_name, start_time=0):
-        """Connect to the device and cast a Media Source. Raises on failure."""
+    def _start(self, source, device_name, ref):
+        """Connect to the device and cast a resolved Media Source."""
         self._casting = True
         try:
             self.attach_device(None)  # old connection must be gone before reconnecting
@@ -130,9 +137,10 @@ class CastSession:
             device.play_media(source.stream_url, source.mime,
                               title=source.title or "", thumb=source.thumbnail or "")
             device.block_until_active(timeout=30)
+            self.resume_ref = ref
 
-            if start_time > 0:
-                self._spawn(lambda: self._seek_when_ready(device, start_time))
+            if source.start_time > 0:
+                self._spawn(lambda: self._seek_when_ready(device, source.start_time))
 
             self.wake()
             self.persist()
@@ -197,7 +205,7 @@ class CastSession:
 
     def attach_device(self, device):
         """Adopt a connected Device (or None to detach). Internal seam —
-        start() uses it; tests use it to inject fakes."""
+        _start() uses it; tests use it to inject fakes."""
         old, self._device = self._device, None
         if old is not None:
             old.disconnect()
@@ -209,6 +217,7 @@ class CastSession:
     def persist(self):
         self._store.update(
             last_url=self.last_url,
+            resume_ref=self.resume_ref.to_dict() if self.resume_ref else None,
             media_title=self.media_title,
             media_thumbnail=self.media_thumbnail,
             media_preview_url=self.media_preview_url,
@@ -235,7 +244,7 @@ class CastSession:
             # and not while a fresh cast's receiver is still loading
             # (transient IDLE within the Post-Cast Idle Grace).
             elif (status.player_state == "IDLE" and not self.intentional_stop
-                  and not self._casting and self.last_url
+                  and not self._casting and self.resume_ref
                   and self._now() - self.last_cast_at > self._idle_grace_s):
                 duration = status.duration or 0
                 if duration > 0 and self.last_position > 0 and (duration - self.last_position) < 5:
@@ -261,7 +270,8 @@ class CastSession:
 
             self._sleep(self._resume_settle_s)  # let the device fully wake
             device = self._device
-            if not device or not self.last_url:
+            ref = self.resume_ref
+            if not device or not ref:
                 return
             try:
                 if device.media_status.player_state in ("PLAYING", "BUFFERING", "PAUSED"):
@@ -270,8 +280,9 @@ class CastSession:
                 pass
 
             # Re-resolve: the old stream URL has likely expired
-            source = self._resolve_source(self.last_url)
+            source = self._resolver.resolve(ref)
             with self._lock:
+                self._local_file_path = source.local_path
                 self.media_preview_url = source.preview_url
                 self.media_title = source.title
                 self.media_thumbnail = source.thumbnail
@@ -284,8 +295,12 @@ class CastSession:
                 device.seek(self.last_position)
             self.wake()
             self.persist()
-        except Exception:
+        except ResolveError as e:
+            log.warning("auto-resume of %s %r failed: %s", ref.kind, ref.value, e)
             self.intentional_stop = True  # stop retrying on failure
+        except Exception:
+            log.exception("auto-resume failed")
+            self.intentional_stop = True
         finally:
             self._casting = False
             self._resume_lock.release()

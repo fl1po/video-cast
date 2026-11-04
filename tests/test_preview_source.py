@@ -1,10 +1,9 @@
 """The Device and the Preview no longer share a URL: the Device gets the
 best muxed format (usually HLS, which browsers can't play), while
-pick_preview_url chooses a separate progressive URL for the muted Preview.
+the resolver chooses a separate progressive URL for the muted Preview.
 MediaSource keeps the old behavior for simple sources — a progressive mp4
 previews as itself, bare HLS has no preview."""
-from app import pick_preview_url
-from session import MediaSource
+from mediasource import MediaRef, MediaSource, MediaSourceResolver
 
 
 YT_FORMATS = [  # trimmed shape of a real YouTube listing
@@ -25,16 +24,24 @@ YT_FORMATS = [  # trimmed shape of a real YouTube listing
 ]
 
 
+def preview_for(formats):
+    """The Preview URL a YouTube page resolves to, given its format listing."""
+    info = {"url": "http://cdn/hls1080", "protocol": "m3u8_native", "formats": formats}
+    resolver = MediaSourceResolver(extract=lambda url: info, upload_dir="unused",
+                                   device_host=lambda: "10.0.0.5:5000")
+    return resolver.resolve(MediaRef.url("https://www.youtube.com/watch?v=1")).preview_url
+
+
 def test_preview_picks_h264_720_over_bigger_or_fancier_codecs():
-    assert pick_preview_url(YT_FORMATS) == "http://cdn/720mp4"
+    assert preview_for(YT_FORMATS) == "http://cdn/720mp4"
 
 
 def test_preview_requires_a_progressive_video_format():
     hls_only = [f for f in YT_FORMATS if f["protocol"] != "https"]
     audio_only = [f for f in YT_FORMATS if f["vcodec"] == "none"]
-    assert pick_preview_url(hls_only) == ""
-    assert pick_preview_url(audio_only) == ""
-    assert pick_preview_url([]) == ""
+    assert preview_for(hls_only) is None
+    assert preview_for(audio_only) is None
+    assert preview_for([]) is None
 
 
 def test_progressive_source_previews_as_itself():

@@ -25,8 +25,20 @@ Fans the Cast Session's status out to SSE subscribers; wakes on device events (`
 _Avoid_: SSE machinery, event bus
 
 **Media Source**:
-The resolved thing a cast plays: `{stream_url, preview_url, title, thumbnail, mime}`, produced from a page URL (via yt-dlp), a direct stream URL, an uploaded file, or an m3u playlist. `stream_url` is what the Device plays (best muxed format, usually HLS for YouTube); `preview_url` is a browser-playable progressive URL for the muted Preview (empty when none exists — the Preview then stays down). The Cast Session receives a `resolve_source(url) → Media Source` callable for auto-resume; the deep resolver is a planned separate module.
+The resolved thing a cast plays: `{stream_url, preview_url, title, thumbnail, mime}`, produced from a page URL (via yt-dlp), a direct stream URL, an uploaded file, or an m3u playlist. `stream_url` is what the Device plays (best muxed format, usually HLS for YouTube); `preview_url` is a browser-playable progressive URL for the muted Preview (empty when none exists — the Preview then stays down). Also carries the start time a Media Ref asks for (e.g. `?t=90`).
 _Avoid_: stream info, video info
+
+**Media Ref**:
+What the user asked to cast, in a form that can be resolved again later: a URL (page or direct stream) or an uploaded file. An uploaded m3u playlist becomes a URL ref for the stream it names — the playlist file is not kept as a ref.
+_Avoid_: last_url, attempt
+
+**Resume Ref**:
+The Media Ref of the last cast that actually started — what auto-resume re-resolves when the TV wakes. Distinct from the last URL the user typed (which pre-fills the URL box even if its cast failed): a failed or mistyped cast never replaces the Resume Ref.
+_Avoid_: last_url
+
+**Media Source Resolver**:
+Turns a Media Ref into a Media Source: page vs direct stream classification, yt-dlp extraction, m3u reading, upload storage, relay routing, start time. The single place this happens — the cast routes and auto-resume both go through it. Fails with one user-facing resolve error.
+_Avoid_: resolver function, yt-dlp wrapper
 
 **Preview**:
 The muted local `<video>` element mirroring the Device. Driven by the sync engine's actions; never the source of truth.
