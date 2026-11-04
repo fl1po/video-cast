@@ -13,7 +13,7 @@ segment — so the relay looks healthy and the log stays empty:
 """
 import yt_dlp
 
-from app import YT_DLP_FORMAT, MAX_CAST_HEIGHT
+from mediasource import YT_DLP_FORMAT, MAX_CAST_HEIGHT
 
 
 def select(formats):

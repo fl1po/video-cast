@@ -4,11 +4,13 @@ trigger the auto-resume policy — only an IDLE outside the Post-Cast Idle
 Grace is an unexpected stop worth recovering from."""
 import time
 
+from mediasource import MediaRef
+
 
 def test_transient_idle_right_after_cast_does_not_trigger_auto_resume(cast_session, device, monkeypatch):
     calls = []
     monkeypatch.setattr(cast_session, "_auto_resume", lambda: calls.append("resume"))
-    monkeypatch.setattr(cast_session, "last_url", "https://example.com/video")
+    monkeypatch.setattr(cast_session, "resume_ref", MediaRef.url("https://example.com/video"))
     monkeypatch.setattr(cast_session, "last_position", 100)
 
     monkeypatch.setattr(cast_session, "last_cast_at", time.time())
@@ -20,7 +22,7 @@ def test_transient_idle_right_after_cast_does_not_trigger_auto_resume(cast_sessi
 def test_idle_outside_the_grace_still_triggers_auto_resume(cast_session, device, monkeypatch):
     calls = []
     monkeypatch.setattr(cast_session, "_auto_resume", lambda: calls.append("resume"))
-    monkeypatch.setattr(cast_session, "last_url", "https://example.com/video")
+    monkeypatch.setattr(cast_session, "resume_ref", MediaRef.url("https://example.com/video"))
     monkeypatch.setattr(cast_session, "last_position", 100)
 
     monkeypatch.setattr(cast_session, "last_cast_at", time.time() - 60)

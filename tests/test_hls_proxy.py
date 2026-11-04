@@ -2,8 +2,8 @@
 headers, so neither the cast receiver (HLS via XHR) nor a remote/VPN'd
 browser can fetch them directly. Everything routes through /api/relay:
 manifests get every URI rewritten, other media streams through."""
-from app import parse_byte_range, rewrite_hls_manifest, route_via_relay
-from session import MediaSource
+from mediasource import MediaRef, MediaSourceResolver
+from relay import parse_byte_range, rewrite_hls_manifest
 
 
 BASE = "https://cdn.example/path/index.m3u8?sig=abc"
@@ -54,22 +54,34 @@ def test_byte_range_parsing():
     assert parse_byte_range("bytes=0-1,5-6") is None, "multipart falls back to full"
 
 
+def resolver_returning(info):
+    return MediaSourceResolver(extract=lambda url: info, upload_dir="unused",
+                               device_host=lambda: "10.0.0.5:5000")
+
+
 def test_googlevideo_source_routes_both_sides_through_the_relay():
-    source = route_via_relay(MediaSource(
-        stream_url="https://manifest.googlevideo.com/x.m3u8",
-        mime="application/x-mpegURL",
-        preview_url="https://rr1.googlevideo.com/videoplayback?itag=136"))
+    source = resolver_returning({
+        "url": "https://manifest.googlevideo.com/x.m3u8", "protocol": "m3u8_native",
+        "formats": [{"protocol": "https", "vcodec": "avc1.64001f", "height": 720,
+                     "url": "https://rr1.googlevideo.com/videoplayback?itag=136"}],
+    }).resolve(MediaRef.url("https://www.youtube.com/watch?v=1"))
     # the Device needs an absolute URL, the Preview a page-relative one
-    assert source.stream_url.startswith("http://")
-    assert "/api/relay?u=https%3A%2F%2Fmanifest.googlevideo.com" in source.stream_url
+    assert source.stream_url.startswith(
+        "http://10.0.0.5:5000/api/relay?u=https%3A%2F%2Fmanifest.googlevideo.com")
     assert source.preview_url.startswith("/api/relay?u=https%3A%2F%2Frr1.googlevideo.com")
 
 
-def test_other_sources_are_left_alone():
-    source = route_via_relay(MediaSource(stream_url="https://iptv.example/live.m3u8",
-                                         mime="application/x-mpegURL"))
-    assert source.stream_url == "https://iptv.example/live.m3u8"
-    assert source.preview_url is None
+def test_a_pasted_googlevideo_stream_is_relayed_too():
+    source = resolver_returning(None).resolve(
+        MediaRef.url("https://manifest.googlevideo.com/api/index.m3u8"))
+    assert source.stream_url.startswith("http://10.0.0.5:5000/api/relay?u=")
 
-    mp4 = route_via_relay(MediaSource(stream_url="https://cdn.example/v.mp4"))
+
+def test_other_sources_are_left_alone():
+    resolver = resolver_returning(None)
+    live = resolver.resolve(MediaRef.url("https://iptv.example/live.m3u8"))
+    assert live.stream_url == "https://iptv.example/live.m3u8"
+    assert live.preview_url is None
+
+    mp4 = resolver.resolve(MediaRef.url("https://cdn.example/v.mp4"))
     assert mp4.stream_url == mp4.preview_url == "https://cdn.example/v.mp4"

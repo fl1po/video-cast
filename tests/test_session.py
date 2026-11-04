@@ -5,7 +5,8 @@ that used to be impossible (auto_resume could only be stubbed out)."""
 import pytest
 
 from conftest import FakeDevice
-from session import CastSession, MediaSource, NoActiveCast
+from mediasource import MediaRef, MediaSource, ResolveError
+from session import CastSession, NoActiveCast
 from store import StateStore
 
 
@@ -31,6 +32,20 @@ class StubPlatform:
         return self.device
 
 
+class FnResolver:
+    """Resolves a Media Ref by handing its value to fn — the Cast Session's
+    view of the Media Source Resolver, minus its rules."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def resolve(self, ref):
+        return self.fn(ref.value)
+
+    def legacy_ref(self, last_url):
+        return MediaRef.url(last_url) if last_url else None
+
+
 SOURCE = MediaSource(stream_url="http://cdn/video.mp4", title="A Video",
                      thumbnail="http://cdn/thumb.jpg")
 
@@ -39,14 +54,13 @@ def make_session(tmp_path, device, resolve=None, clock=None):
     clock = clock or FakeClock()
     store = StateStore(str(tmp_path / "state.json"))
     session = CastSession(
-        StubPlatform(device), resolve or (lambda url: SOURCE), store,
+        StubPlatform(device), FnResolver(resolve or (lambda url: SOURCE)), store,
         now=clock.now, sleep=lambda s: None, spawn=lambda fn: fn())
     return session, clock
 
 
 def cast(session, device, url="https://example.com/watch?v=1"):
-    session.note_attempt(url)
-    session.start(SOURCE, "TV")
+    session.cast(MediaRef.url(url), "TV")
 
 
 def test_start_casts_and_persists(tmp_path):
@@ -70,6 +84,7 @@ def test_session_restores_from_the_store(tmp_path):
 
     restored, _ = make_session(tmp_path, FakeDevice())
     assert restored.last_url == "https://example.com/watch?v=1"
+    assert restored.resume_ref == MediaRef.url("https://example.com/watch?v=1")
     assert restored.last_position == 42.0
     assert restored.media_title == "A Video"
 
@@ -85,6 +100,7 @@ def test_unexpected_idle_resumes_at_last_position(tmp_path):
 
     session, clock = make_session(tmp_path, device, resolve=resolve)
     cast(session, device)
+    resolved.clear()  # count only what auto-resume resolves
 
     device.confirm(player_state="PLAYING", current_time=100.0)  # position tracked
     clock.advance(20)  # leave the post-cast idle grace
@@ -101,6 +117,7 @@ def test_transient_idle_within_the_grace_does_not_resume(tmp_path):
     session, clock = make_session(
         tmp_path, device, resolve=lambda url: resolved.append(url) or SOURCE)
     cast(session, device)
+    resolved.clear()
 
     device.confirm(player_state="IDLE", current_time=0)  # still within the grace
 
@@ -113,6 +130,7 @@ def test_idle_near_the_end_is_a_natural_finish_not_a_crash(tmp_path):
     session, clock = make_session(
         tmp_path, device, resolve=lambda url: resolved.append(url) or SOURCE)
     cast(session, device)
+    resolved.clear()
 
     device.confirm(player_state="PLAYING", current_time=598.0)  # duration is 600
     clock.advance(20)
@@ -133,6 +151,7 @@ def test_resume_cooldown_limits_attempts(tmp_path):
 
     session, clock = make_session(tmp_path, device, resolve=resolve)
     cast(session, device)
+    resolved.clear()
 
     device.confirm(player_state="PLAYING", current_time=100.0)
     clock.advance(20)
@@ -145,14 +164,17 @@ def test_resume_cooldown_limits_attempts(tmp_path):
 
 def test_failed_resume_stops_retrying(tmp_path):
     device = FakeDevice()
-    attempts = []
 
     def resolve(url):
+        if attempts is None:  # the first cast works; the stream is gone later
+            return SOURCE
         attempts.append(url)
-        raise RuntimeError("stream gone")
+        raise ResolveError("stream gone")
 
     session, clock = make_session(tmp_path, device, resolve=resolve)
+    attempts = None
     cast(session, device)
+    attempts = []
 
     device.confirm(player_state="PLAYING", current_time=100.0)
     clock.advance(20)
@@ -166,9 +188,10 @@ def test_failed_resume_stops_retrying(tmp_path):
 
 def test_m3u8_stream_has_no_preview_url(tmp_path):
     device = FakeDevice()
-    session, clock = make_session(tmp_path, device)
-    session.start(MediaSource(stream_url="http://cdn/live.m3u8", title="Live",
-                              mime="application/x-mpegURL"), "TV")
+    live = MediaSource(stream_url="http://cdn/live.m3u8", title="Live",
+                       mime="application/x-mpegURL")
+    session, clock = make_session(tmp_path, device, resolve=lambda url: live)
+    cast(session, device, "http://cdn/live.m3u8")
 
     assert session.status()["stream_url"] == ""
 
@@ -209,11 +232,11 @@ def test_start_time_survives_the_receiver_load_window(tmp_path):
     """The ?t= seek must stick even though the receiver drops every seek
     sent while it is still BUFFERING on load."""
     device = SlowLoadingDevice(load_ticks=3)
-    session, clock = make_session(tmp_path, device)
+    at_90 = MediaSource(stream_url="http://cdn/video.mp4", start_time=90)
+    session, clock = make_session(tmp_path, device, resolve=lambda url: at_90)
     session._sleep = lambda s: device.tick()  # loop ticks drive the load
 
-    session.note_attempt("https://example.com/watch?v=1&t=90")
-    session.start(SOURCE, "TV", start_time=90)
+    cast(session, device, "https://example.com/watch?v=1&t=90")
 
     assert ("seek", 90) in device.commands
     assert device.media_status.current_time == 90
