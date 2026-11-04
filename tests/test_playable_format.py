@@ -72,16 +72,24 @@ def test_falls_back_when_no_hls_is_available():
 
 
 class FakeMediaController:
-    def __init__(self):
+    def __init__(self, calls):
         self.kwargs = None
+        self._calls = calls
 
     def play_media(self, url, content_type, **kwargs):
         self.kwargs = kwargs
+        self._calls.append("load")
 
 
 class FakeCast:
-    def __init__(self):
-        self.media_controller = FakeMediaController()
+    def __init__(self, app_id=None):
+        self.calls = []
+        self.app_id = app_id
+        self.media_controller = FakeMediaController(self.calls)
+
+    def start_app(self, app_id, force_launch=False, timeout=None):
+        self.calls.append(("start_app", app_id))
+        self.app_id = app_id
 
 
 def test_load_announces_a_buffered_stream_not_live():
@@ -91,3 +99,51 @@ def test_load_announces_a_buffered_stream_not_live():
                                       "application/x-mpegURL", title="t")
     assert cc.media_controller.kwargs["stream_type"] == "BUFFERED", (
         "pychromecast 14 defaults to LIVE, which drops duration and seek")
+
+
+def test_load_launches_the_media_receiver_over_a_foreign_app():
+    # pychromecast's default media_controller has app_must_match=False: if
+    # the running app (Spotify, YouTube...) exposes the media namespace, the
+    # LOAD goes to that app, which silently ignores it — nothing on the TV.
+    from castplatform import PychromecastDevice
+    from pychromecast.config import APP_MEDIA_RECEIVER
+    cc = FakeCast(app_id="AndroidNativeApp")
+    PychromecastDevice(cc).play_media("http://host/x.m3u8",
+                                      "application/x-mpegURL", title="t")
+    assert cc.calls == [("start_app", APP_MEDIA_RECEIVER), "load"]
+
+
+def test_load_reuses_a_running_media_receiver():
+    from castplatform import PychromecastDevice
+    from pychromecast.config import APP_MEDIA_RECEIVER
+    cc = FakeCast(app_id=APP_MEDIA_RECEIVER)
+    PychromecastDevice(cc).play_media("http://host/x.mp4", "video/mp4")
+    assert cc.calls == ["load"]
+
+
+class FakeBrowser:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def stop_discovery(self):
+        self._calls.append("stop_discovery")
+
+
+def test_discovery_outlives_the_connection(monkeypatch):
+    # The socket client reconnects through the browser's zeroconf instance;
+    # closing it while connected turns the first dropped connection into an
+    # endless "Zeroconf instance loop must be running" traceback loop.
+    import pychromecast
+    from castplatform import PychromecastPlatform
+    cc = FakeCast()
+    cc.wait = lambda timeout=None: None
+    cc.quit_app = lambda: cc.calls.append("quit_app")
+    cc.disconnect = lambda timeout=None: cc.calls.append("disconnect")
+    monkeypatch.setattr(pychromecast, "get_listed_chromecasts",
+                        lambda friendly_names: ([cc], FakeBrowser(cc.calls)))
+    monkeypatch.setattr("castplatform.time.sleep", lambda s: None)
+
+    device = PychromecastPlatform().connect("TV")
+    assert "stop_discovery" not in cc.calls
+    device.disconnect()
+    assert cc.calls == ["quit_app", "disconnect", "stop_discovery"]
