@@ -49,8 +49,11 @@ class _CastListener:
 class PychromecastDevice:
     """A connected Chromecast, seen through pychromecast."""
 
-    def __init__(self, cc):
+    def __init__(self, cc, browser=None):
         self._cc = cc
+        # The discovery browser owns the zeroconf instance the socket client
+        # reconnects through — it must live exactly as long as the connection.
+        self._browser = browser
 
     def play_media(self, url, mime, title="", thumb=""):
         # The default media_controller is built with app_must_match=False:
@@ -116,6 +119,13 @@ class PychromecastDevice:
             self._cc.disconnect(timeout=5)
         except Exception:
             pass
+        # Only after the socket client is gone: stopping discovery closes its
+        # zeroconf, and a live client then retries in a tight traceback loop.
+        if self._browser is not None:
+            try:
+                self._browser.stop_discovery()
+            except Exception:
+                pass
         time.sleep(3)
 
 
@@ -135,9 +145,14 @@ class PychromecastPlatform:
     def connect(self, friendly_name, timeout=30):
         casts, browser = pychromecast.get_listed_chromecasts(friendly_names=[friendly_name])
         if not casts:
-            pychromecast.discovery.stop_discovery(browser)
+            browser.stop_discovery()
             raise ConnectError("Could not connect to Chromecast. Is it on?")
         cc = casts[0]
-        cc.wait(timeout=timeout)
-        pychromecast.discovery.stop_discovery(browser)
-        return PychromecastDevice(cc)
+        try:
+            cc.wait(timeout=timeout)
+        except Exception:
+            cc.disconnect(timeout=5)
+            browser.stop_discovery()
+            raise
+        # Discovery keeps running: see PychromecastDevice.disconnect().
+        return PychromecastDevice(cc, browser)

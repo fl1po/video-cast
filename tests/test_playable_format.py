@@ -120,3 +120,30 @@ def test_load_reuses_a_running_media_receiver():
     PychromecastDevice(cc).play_media("http://host/x.mp4", "video/mp4")
     assert cc.calls == ["load"]
 
+
+class FakeBrowser:
+    def __init__(self, calls):
+        self._calls = calls
+
+    def stop_discovery(self):
+        self._calls.append("stop_discovery")
+
+
+def test_discovery_outlives_the_connection(monkeypatch):
+    # The socket client reconnects through the browser's zeroconf instance;
+    # closing it while connected turns the first dropped connection into an
+    # endless "Zeroconf instance loop must be running" traceback loop.
+    import pychromecast
+    from castplatform import PychromecastPlatform
+    cc = FakeCast()
+    cc.wait = lambda timeout=None: None
+    cc.quit_app = lambda: cc.calls.append("quit_app")
+    cc.disconnect = lambda timeout=None: cc.calls.append("disconnect")
+    monkeypatch.setattr(pychromecast, "get_listed_chromecasts",
+                        lambda friendly_names: ([cc], FakeBrowser(cc.calls)))
+    monkeypatch.setattr("castplatform.time.sleep", lambda s: None)
+
+    device = PychromecastPlatform().connect("TV")
+    assert "stop_discovery" not in cc.calls
+    device.disconnect()
+    assert cc.calls == ["quit_app", "disconnect", "stop_discovery"]
