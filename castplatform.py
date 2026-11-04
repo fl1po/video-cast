@@ -22,6 +22,7 @@ commands never synthesize events. The No-Echo Rule depends on this.
 import time
 
 import pychromecast
+from pychromecast.config import APP_MEDIA_RECEIVER
 from pychromecast.controllers.media import STREAM_TYPE_BUFFERED
 
 
@@ -52,6 +53,13 @@ class PychromecastDevice:
         self._cc = cc
 
     def play_media(self, url, mime, title="", thumb=""):
+        # The default media_controller is built with app_must_match=False:
+        # when another app (Spotify, YouTube...) is running and exposes the
+        # media namespace, pychromecast sends the LOAD to *that* app instead
+        # of launching the Default Media Receiver. The app ignores it and
+        # nothing happens on the TV — so launch the receiver ourselves.
+        if self._cc.app_id != APP_MEDIA_RECEIVER:
+            self._cc.start_app(APP_MEDIA_RECEIVER, timeout=20)
         # stream_type must be passed explicitly: pychromecast 14 changed
         # play_media's default from BUFFERED to LIVE, and the receiver
         # rejects a VOD source announced as LIVE — it fetches the manifest
