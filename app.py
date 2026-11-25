@@ -25,7 +25,8 @@ from flask import Flask, render_template, request, jsonify, Response, send_file
 import requests
 
 from devices import DeviceRegistry
-from mediasource import MediaRef, MediaSourceResolver, YtDlpExtractor
+from mediasource import (MediaRef, MediaSourceResolver, YtDlpExtractor,
+                         update_yt_dlp_in_background)
 from relay import parse_byte_range, relay_url, rewrite_hls_manifest
 from session import CastSession, NoActiveCast
 from sse import StatusBroadcaster
@@ -360,4 +361,6 @@ def configure_logging():
 
 if __name__ == "__main__":
     configure_logging()
+    if os.environ.get("VIDEOCAST_AUTO_UPDATE", "1") != "0":
+        update_yt_dlp_in_background()
     create_app().run(host="0.0.0.0", port=PORT, debug=False, threaded=True)

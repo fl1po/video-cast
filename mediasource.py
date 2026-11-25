@@ -22,6 +22,9 @@ import logging
 import mimetypes
 import os
 import re
+import subprocess
+import sys
+import threading
 from dataclasses import dataclass
 from urllib.parse import urlparse, parse_qs
 
@@ -267,6 +270,48 @@ JS_RUNTIME_DIRS = [
 ]
 
 
+# YouTube changes often and old yt-dlp releases break with errors like "The
+# page needs to be reloaded", so the app upgrades yt-dlp on every start.
+# Extraction waits for the upgrade: yt_dlp is imported lazily, and importing
+# it while pip is replacing its files would load a half-installed package.
+_yt_dlp_ready = threading.Event()
+_yt_dlp_ready.set()
+YT_DLP_UPDATE_WAIT = 120  # seconds an extract waits on a running upgrade
+
+
+def update_yt_dlp_in_background():
+    """pip install -U yt-dlp[default] on a daemon thread. Failures (offline,
+    locked files) are logged and ignored — the installed version still runs."""
+    _yt_dlp_ready.clear()
+
+    def run():
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade",
+                 "--quiet", "--disable-pip-version-check",
+                 "--timeout", "15", "--retries", "1", "yt-dlp[default]"],
+                capture_output=True, text=True, timeout=300,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            if result.returncode:
+                log.warning("yt-dlp update failed: %s", result.stderr.strip())
+            else:
+                log.info("yt-dlp is up to date (%s)", _installed_yt_dlp_version())
+        except Exception as e:
+            log.warning("yt-dlp update failed: %s", e)
+        finally:
+            _yt_dlp_ready.set()
+
+    threading.Thread(target=run, name="yt-dlp-update", daemon=True).start()
+
+
+def _installed_yt_dlp_version():
+    from importlib.metadata import version
+    try:
+        return version("yt-dlp")
+    except Exception:
+        return None
+
+
 class YtDlpExtractor:
     """extract(url) -> info dict, via yt-dlp. Raises ResolveError."""
 
@@ -292,9 +337,15 @@ class YtDlpExtractor:
             self._opts["cookiesfrombrowser"] = (cookies_from_browser,)
 
     def __call__(self, url):
+        _yt_dlp_ready.wait(timeout=YT_DLP_UPDATE_WAIT)
         import yt_dlp
         try:
             with yt_dlp.YoutubeDL(dict(self._opts)) as ydl:
                 return ydl.sanitize_info(ydl.extract_info(url, download=False))
         except yt_dlp.utils.DownloadError as e:
-            raise ResolveError(f"yt-dlp: {e}") from e
+            msg = f"yt-dlp: {e}"
+            installed = _installed_yt_dlp_version()
+            if installed and installed != yt_dlp.version.__version__:
+                msg += (f" (yt-dlp {installed} is installed but this run still"
+                        f" uses {yt_dlp.version.__version__} — restart the app)")
+            raise ResolveError(msg) from e

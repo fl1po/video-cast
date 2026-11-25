@@ -15,6 +15,8 @@ python app.py
 
 > **Note:** `yt-dlp[default]` (not plain `yt-dlp`) is required — it includes `yt-dlp-ejs`, which solves YouTube's JS challenge. Without it most formats are unavailable and casting YouTube URLs fails with "Requested format is not available". A JS runtime (Node.js or Deno) must also be installed.
 
+> **Auto-update:** YouTube changes often and old yt-dlp releases break (e.g. "The page needs to be reloaded"), so the app runs `pip install -U "yt-dlp[default]"` in the background on every start. Set `VIDEOCAST_AUTO_UPDATE=0` to disable.
+
 Open `http://localhost:5000` in your browser.
 
 To access from other devices on your network (e.g. phone), use your PC's IP: `http://<your-ip>:5000`
